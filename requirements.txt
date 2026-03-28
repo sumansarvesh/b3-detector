@@ -1,5 +1,4 @@
 requests==2.31.0
 python-telegram-bot==20.3
-numpy==1.26.4
-pandas==2.1.4
---only-binary=:all:
+numpy==2.2.3
+pandas==2.2.3
