@@ -15,7 +15,13 @@ def get_candles(symbol, resolution, limit=100):
         end   = int(datetime.now().timestamp())
         start = end - limit * resolution * 60
         r = requests.get("https://api.india.delta.exchange/v2/history/candles",
-            "resolution": {5:"5m",15:"15m",30:"30m",60:"1h"}.get(resolution,"5m"), "symbol": symbol, "start": start, "end": end, timeout=15)
+        res_map = {5: "5m", 15: "15m", 30: "30m", 60: "1h"}
+        res_str = res_map.get(resolution, "5m")
+        r = requests.get(
+            "https://api.india.delta.exchange/v2/history/candles",
+            params={"resolution": res_str, "symbol": symbol, "start": start, "end": end},
+            timeout=15
+        )
         data = r.json()
         if data.get("success") and data.get("result"):
             return data["result"]
