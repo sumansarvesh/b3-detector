@@ -563,7 +563,7 @@ def main():
             all_signals = []
             
             for inst_name, inst_config in INSTRUMENTS.items():
-                if inst_config["exchange"] != "upstox":
+                if inst_config["exchange"] == "skip_upstox"::
                     continue
                 
                 try:
