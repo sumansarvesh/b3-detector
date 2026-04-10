@@ -8,6 +8,8 @@ SYMBOLS    = ["BTCUSD", "ETHUSD"]
 TIMEFRAMES = [5, 15, 30, 60]
 BB_PERIOD  = 20
 RES_MAP    = {5: "5m", 15: "15m", 30: "30m", 60: "1h"}
+FLAT_WINDOW     = 4
+FLAT_THRESHOLD  = 0.005
 
 def get_candles(symbol, resolution, limit=100):
     res_str = RES_MAP.get(resolution, "5m")
@@ -32,7 +34,7 @@ def calc_bb(closes):
     std = s.rolling(BB_PERIOD).std().values
     return sma + 2*std, sma, sma - 2*std
 
-def is_flat(series, window=8, threshold=0.002):
+def is_flat(series, window=FLAT_WINDOW, threshold=FLAT_THRESHOLD):
     r = series[-window:]
     r = r[~np.isnan(r)]
     if len(r) < 3:
@@ -64,34 +66,43 @@ def detect(symbol, tf, candles):
     pp_zone = "PERFECT" if dist <= 0 else "OK"
     if cl[-1] > op[-1] and cl[-1] >= upper[-1]:
         direction, entry, sl = "BULLISH", cl[-1], lo[-1]
+        ce_pe = "BUY CE ATM"
     elif cl[-1] < op[-1] and cl[-1] <= lower[-1]:
         direction, entry, sl = "BEARISH", cl[-1], hi[-1]
+        ce_pe = "BUY PE ATM"
     else:
         return None
+    tf_score = {5:3, 15:5, 30:6, 60:8}.get(tf, 3)
     return {
-        "symbol": symbol, "tf": tf, "direction": direction,
-        "entry": round(entry, 2), "sl": round(sl, 2), "pp_zone": pp_zone,
-        "upper": round(float(upper[-1]), 2), "sma": round(float(sma[-1]), 2),
+        "symbol": symbol, "tf": tf, "tf_score": tf_score,
+        "direction": direction, "entry": round(entry, 2),
+        "sl": round(sl, 2), "pp_zone": pp_zone, "ce_pe": ce_pe,
+        "upper": round(float(upper[-1]), 2),
+        "sma":   round(float(sma[-1]),   2),
         "lower": round(float(lower[-1]), 2),
-        "time": datetime.now().strftime("%H:%M:%S")
+        "time":  datetime.now().strftime("%H:%M:%S")
     }
 
 def send_alert(s):
-    e   = "📈" if s["direction"] == "BULLISH" else "📉"
-    opt = "BUY CE ATM" if s["direction"] == "BULLISH" else "BUY PE ATM"
+    e = "📈" if s["direction"] == "BULLISH" else "📉"
+    tf_score = s["tf_score"]
     msg = (
         f"{e} <b>B3 FLAT BB JACKPOT</b>\n\n"
         f"<b>Symbol:</b> {s['symbol']}\n"
-        f"<b>TF:</b> {s['tf']}min\n"
+        f"<b>Timeframe:</b> {s['tf']}min | Score: {tf_score}/8\n"
         f"<b>Direction:</b> {s['direction']}\n"
-        f"<b>Option:</b> {opt}\n"
+        f"<b>Option:</b> {s['ce_pe']} — Current Expiry\n\n"
         f"<b>Entry:</b> {s['entry']}\n"
         f"<b>SL:</b> {s['sl']}\n"
+        f"<b>R:R:</b> 1:2 minimum\n\n"
+        f"<b>BB Levels (All Flat):</b>\n"
+        f"  Upper: {s['upper']}\n"
+        f"  SMA20: {s['sma']}\n"
+        f"  Lower: {s['lower']}\n\n"
         f"<b>PP Zone:</b> {s['pp_zone']}\n"
-        f"<b>Upper:</b> {s['upper']} Flat\n"
-        f"<b>SMA20:</b> {s['sma']} Flat\n"
-        f"<b>Lower:</b> {s['lower']} Flat\n"
-        f"<b>Time:</b> {s['time']}"
+        f"<b>Volume Spike:</b> Confirmed\n"
+        f"<b>Time:</b> {s['time']}\n\n"
+        f"<i>SL = blast candle {'low' if s['direction']=='BULLISH' else 'high'}</i>"
     )
     try:
         r = requests.post(
@@ -106,6 +117,7 @@ def send_alert(s):
 def main():
     print("=" * 50)
     print("B3 FLAT BB DETECTOR - DELTA (BTC+ETH)")
+    print(f"Flat Window: {FLAT_WINDOW} candles | Threshold: {FLAT_THRESHOLD}")
     print("=" * 50)
     scan = 0
     while True:
