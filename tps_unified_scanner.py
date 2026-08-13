@@ -42,6 +42,10 @@ logger = logging.getLogger("TPS")
 
 IST = pytz.timezone('Asia/Kolkata')
 
+# ── S9 Pivot Confluence Blast ─────────────────────────────────────
+import s9_upgrades
+from s9_detector import S9Engine
+
 # ═══════════════════════════════════════════════════════════════════
 # UNIFIED PARAMETERS
 # ═══════════════════════════════════════════════════════════════════
@@ -58,6 +62,9 @@ class PARAMS:
     SCAN_INTERVAL_SEC = 300      # 5 min
     TIMEFRAMES        = ["5m", "15m", "30m", "1h"]
     OTM_STRIKES       = 2        # Upstox (Indian) options
+    MIN_VOLUME        = 100      # illiquid contract floor (S9 entry gate)
+    S9_TOP_STOCKS     = 50       # S9 universe: top N active N100 stocks
+    S9_CLOSE_BUFFER   = 20       # candle close ke kitne sec baad S9 chale
     DELTA_OTM_STRIKES = 4        # BTC/ETH — 4 strikes away
 
     TF_SCORE = {
@@ -542,14 +549,19 @@ def format_alert(symbol: str, signals: dict, score: int, source: str, option_typ
 def upstox_headers():
     return {"Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}", "Accept": "application/json"}
 
-UPSTOX_TF_MAP = {"5m": "5minute", "15m": "15minute", "30m": "30minute", "1h": "60minute"}
+UPSTOX_TF_MAP = {"5m": "5minute", "15m": "15minute", "30m": "30minute",
+                 "1h": "60minute", "1d": "day"}
+# Har TF ke liye kitne din peeche ka data chahiye. Daily BB(20) ke liye 7 din
+# kaafi nahi — 120 calendar din me ~80 trading candles milte hain.
+UPSTOX_TF_DAYS = {"5m": 7, "15m": 12, "30m": 20, "1h": 40, "1d": 200}
 
-def fetch_upstox_candles(instrument_key: str, tf: str) -> pd.DataFrame | None:
+def fetch_upstox_candles(instrument_key: str, tf: str, days: int = None) -> pd.DataFrame | None:
     if not UPSTOX_ACCESS_TOKEN:
         return None
     resolution = UPSTOX_TF_MAP.get(tf, "5minute")
+    lookback   = days if days is not None else UPSTOX_TF_DAYS.get(tf, 7)
     today      = datetime.now(IST).date()
-    from_date  = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    from_date  = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
     to_date    = today.strftime("%Y-%m-%d")
     encoded    = requests.utils.quote(instrument_key, safe='')
     url        = f"https://api.upstox.com/v2/historical-candle/{encoded}/{resolution}/{to_date}/{from_date}"
@@ -975,15 +987,21 @@ def run_upstox_scanner():
 # DELTA EXCHANGE (BTC/ETH + OPTIONS)
 # ═══════════════════════════════════════════════════════════════════
 DELTA_SYMBOLS = ["BTCUSD", "ETHUSD"]
-DELTA_TF_MAP  = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h"}
+DELTA_TF_MAP  = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "1d"}
+# Har resolution ke seconds — window isi se banti hai.
+# BUG FIX: pehle sab TF ke liye ek hi 5-ghante ka window tha, isliye 30m/1h pe
+# BB_PERIOD(20) candles kabhi milte hi nahi the aur Delta ka 30m/1h scan
+# chup-chaap None return karta tha.
+DELTA_RES_SEC = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "1d": 86400}
 
 # Strike gaps: BTC=$500, ETH=$50
 DELTA_STRIKE_GAP = {"BTCUSD": 500, "ETHUSD": 50}
 
 def fetch_delta_candles(symbol: str, tf: str) -> pd.DataFrame | None:
     resolution = DELTA_TF_MAP.get(tf, "5m")
+    res_sec    = DELTA_RES_SEC.get(tf, 300)
     end_time   = int(time.time())
-    start_time = end_time - (300 * PARAMS.BB_PERIOD * 3)
+    start_time = end_time - (res_sec * PARAMS.BB_PERIOD * 4)
     try:
         resp = requests.get(
             "https://api.india.delta.exchange/v2/history/candles",
@@ -1453,6 +1471,7 @@ def telegram_bot():
                         f"/status — Yeh message\n"
                         f"/pause · /resume\n"
                         f"/scan_s6 — S6 manual scan\n"
+                        f"/scan_s9 — S9 Pivot Confluence Blast scan\n"
                         f"/scan_mp — Money Printer scan\n"
                         f"/scan_superflat — Super Flat scan\n"
                         f"/help — All commands"
@@ -1467,6 +1486,13 @@ def telegram_bot():
                     send_telegram("▶️ <b>Scanner Resumed!</b>")
 
                 # ── CUSTOM SCAN COMMANDS ─────────────────────────────
+                elif text == "/scan_s9":
+                    send_telegram("\u23f3 <b>S9 Scan Start</b> \u2014 pivot confluence blast dhoondh raha hoon...")
+                    try:
+                        Thread(target=_run_s9_on_demand, daemon=True).start()
+                    except Exception as e:
+                        send_telegram(f"\u274c Error: {e}")
+
                 elif text == "/scan_s6":
                     send_telegram("⏳ <b>S6 Scan Start</b> — saare instruments scan kar raha hoon...")
                     try:
@@ -2008,6 +2034,166 @@ def run_money_printer_scanner(active_stocks: list):
 
     logger.info(f"[\U0001f4b0 MONEY PRINTER] Cycle done. Alerts: {alerts}")
 
+
+# ═══════════════════════════════════════════════════════════════════
+# S9 — PIVOT CONFLUENCE BLAST
+# ═══════════════════════════════════════════════════════════════════
+# Setup: Daily PP (previous day H+L+C/3) BB ke ANDAR ho — 5M/15M/30M/1H/Daily
+#        sab pe — phir 5M candle BB upper ke bahar close kare = BLAST.
+# Buying-only. Sirf upside. Detection s9_detector.py me, scoring/ladder/gate
+# s9_upgrades.py me.
+# ═══════════════════════════════════════════════════════════════════
+
+# MIN_VOLUME ek hi jagah se aaye — PARAMS master hai
+s9_upgrades.MIN_VOLUME = PARAMS.MIN_VOLUME
+
+S9_ENGINE = S9Engine(send_fn=send_telegram, log=logger)
+
+_s9_universe       = []
+_s9_universe_time  = 0
+S9_UNIVERSE_TTL    = 3600      # har ghante strike refresh (hourly ranking rule)
+
+
+def _s9_fetch_upstox(key: str, tf: str):
+    return fetch_upstox_candles(key, tf)
+
+
+def _s9_fetch_delta(sym: str, tf: str):
+    return fetch_delta_candles(sym, tf)
+
+
+def build_s9_universe(force: bool = False) -> list:
+    """
+    S9 ka universe — SIRF OPTION CHARTS (buying-only setup hai).
+
+    Returns: [(label, fetch_fn, key, segment), ...]
+      1. Index + MCX commodities ke 2-OTM CE/PE   (NIFTY, SENSEX, GOLD, SILVERM,
+                                                   CRUDEOIL, NATURALGAS)
+      2. Top N active Nifty 100 stocks ke 2-OTM CE/PE
+      3. BTC/ETH ke OTM CE/PE (Delta Exchange)
+    """
+    global _s9_universe, _s9_universe_time
+
+    if not force and _s9_universe and (time.time() - _s9_universe_time) < S9_UNIVERSE_TTL:
+        return _s9_universe
+
+    uni = []
+
+    # ── 1 + 2. Upstox — index/MCX + stocks ──────────────────────────
+    if UPSTOX_ACCESS_TOKEN:
+        if _active_stocks_cache:
+            stocks = _active_stocks_cache[:PARAMS.S9_TOP_STOCKS]
+        else:
+            stocks = fetch_active_nifty100_stocks(top_n=100)[:PARAMS.S9_TOP_STOCKS]
+
+        for (symbol, ikey, opt_base, opt_exch, gap) in list(UPSTOX_SCAN_LIST) + list(stocks):
+            if not (opt_base and opt_exch):
+                continue
+            segment = "MCX" if opt_exch == "MCX_FO" else "NSE"
+            try:
+                ltp = get_current_price(ikey)
+                if not ltp:
+                    continue
+                for label, opt_key, opt_type in get_nearest_expiry_options(
+                        symbol_base=opt_base, exchange=opt_exch, ltp=ltp, strike_gap=gap):
+                    uni.append((f"{symbol} {label}", _s9_fetch_upstox, opt_key, segment))
+                time.sleep(0.2)
+            except Exception as e:
+                logger.error(f"[S9 UNIVERSE] {symbol}: {e}")
+
+    # ── 3. Delta — BTC/ETH options ──────────────────────────────────
+    for sym in DELTA_SYMBOLS:
+        try:
+            df = fetch_delta_candles(sym, "5m")
+            if df is None or len(df) == 0:
+                continue
+            ltp = float(df.iloc[-1]["close"])
+            for label, opt_sym, opt_type in get_delta_otm_options(sym, ltp):
+                uni.append((f"{sym} {label}", _s9_fetch_delta, opt_sym, "CRYPTO"))
+        except Exception as e:
+            logger.error(f"[S9 UNIVERSE] {sym}: {e}")
+
+    _s9_universe      = uni
+    _s9_universe_time = time.time()
+    logger.info(f"[S9] Universe refresh: {len(uni)} option charts")
+    return uni
+
+
+def run_s9_scanner():
+    """Ek S9 cycle — har 5M candle close ke baad."""
+    now = datetime.now(IST).replace(tzinfo=None)
+    S9_ENGINE.new_day_check(now)
+
+    universe = build_s9_universe()
+    if not universe:
+        logger.info("[S9] Universe khali — skip")
+        return
+
+    logger.info(f"[S9] Scan start — {len(universe)} charts")
+    for (label, fetch_fn, key, segment) in universe:
+        try:
+            # fetch_fn ko instrument key chahiye, engine ko human label —
+            # isliye ek chhota wrapper
+            S9_ENGINE.check(label, lambda _s, tf, _k=key, _f=fetch_fn: _f(_k, tf),
+                            segment, now)
+            time.sleep(0.15)
+        except Exception as e:
+            logger.error(f"[S9] {label}: {e}")
+
+    logger.info(f"[S9] Cycle done — {S9_ENGINE.summary()}")
+
+
+def s9_scheduler():
+    """
+    S9 ko CLOCK-ALIGNED chalna hota hai — 9:20 / 9:30 / 9:45 / 10:15 wali
+    ladder steps exact candle close pe hi bijli hain. Main scheduler ka
+    plain sleep(300) loop har cycle me drift karta hai, isliye S9 apne
+    alag thread me har 5-min boundary pe jaagta hai.
+    """
+    logger.info("[S9] Scheduler started (clock-aligned 5-min grid)")
+    while True:
+        try:
+            now = datetime.now(IST)
+            nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            while nxt.minute % 5 != 0:
+                nxt += timedelta(minutes=1)
+            target = nxt + timedelta(seconds=PARAMS.S9_CLOSE_BUFFER)
+            wait = (target - now).total_seconds()
+            if wait > 0:
+                time.sleep(wait)
+
+            if scanner_paused:
+                continue
+
+            t   = datetime.now(IST)
+            wd  = t.weekday()
+            hh, mm = t.hour, t.minute
+            nse_open = wd < 5 and ((hh == 9 and mm >= 15) or (9 < hh < 15) or (hh == 15 and mm <= 30))
+            mcx_open = wd < 5 and ((9 <= hh < 23) or (hh == 23 and mm <= 30))
+
+            if nse_open or mcx_open or True:   # crypto 24x7 — engine segment-wise handle karta hai
+                run_s9_scanner()
+
+        except Exception as e:
+            logger.error(f"[S9 SCHEDULER] {e}")
+            time.sleep(30)
+
+
+def _run_s9_on_demand():
+    """Manual /scan_s9 command handler"""
+    try:
+        start = time.time()
+        run_s9_scanner()
+        send_telegram(
+            f"\u2705 <b>S9 Scan Complete!</b>\n"
+            f"\U0001f4ca {S9_ENGINE.summary()}\n"
+            f"\u23f1 {round(time.time() - start, 1)}s\n"
+            f"\U0001f550 {datetime.now(IST).strftime('%H:%M IST')}"
+        )
+    except Exception as e:
+        send_telegram(f"\u274c S9 Scan Error: {e}")
+
+
 def scheduler():
     while True:
         if scanner_paused:
@@ -2069,8 +2255,10 @@ if __name__ == "__main__":
         "📊 Top 20 Active N100 Stocks (OI+Vol) + options\n"
         "⏰ TF: 5M · 15M · 30M · 1H\n\n"
         f"💰 Money Printer: 1H | Active N100 Stocks\n"
+        f"⭐ S9 Pivot Confluence Blast: ON (clock-aligned 5M grid)\n"
         f"🕐 {datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}"
     )
 
     Thread(target=telegram_bot, daemon=True).start()
+    Thread(target=s9_scheduler, daemon=True).start()
     scheduler()
