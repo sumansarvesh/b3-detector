@@ -59,6 +59,13 @@ FLAT_THRESHOLD = 0.002      # 0.2% — S6 wali flat definition
 
 S9_TFS = ["5m", "15m", "30m", "1h", "1d"]
 
+# Daily TF ka confluence check kis segment pe chalega.
+# CRYPTO=False kyunki Delta ke daily-expiry options 1-2 din purane hote hain —
+# unke paas daily BB(20) ke liye 22 candles kabhi nahi hongi, aur check hamesha
+# chupchaap fail karta rehta. NSE/MCX ke option contracts me history hoti hai,
+# wahan daily confluence bana rehta hai.
+DAILY_TF_REQUIRED = {"NSE": True, "MCX": True, "CRYPTO": False}
+
 # TF ka cache TTL (seconds). 1d ka cache din bhar ka hota hai (alag handle).
 TF_CACHE_TTL = {"5m": 0, "15m": 300, "30m": 600, "1h": 900, "1d": 86400}
 
@@ -340,7 +347,10 @@ class S9Engine:
         # PP sab TF pe BB ke andar? (5M pe pre-blast candle dekho)
         if pp_inside_bb(df5, pp, use_prev_candle=True) is not True:
             return sent
-        for tf in ["15m", "30m", "1h", "1d"]:
+        higher_tfs = ["15m", "30m", "1h"]
+        if DAILY_TF_REQUIRED.get(segment, True):
+            higher_tfs.append("1d")
+        for tf in higher_tfs:
             dft = self.get_df(sym, tf, fetch_fn, now)
             if pp_inside_bb(dft, pp) is not True:
                 return sent
