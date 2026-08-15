@@ -76,7 +76,9 @@ class PARAMS:
         frozenset(["30m", "1h"]):               9,
         frozenset(["5m", "15m", "30m", "1h"]): 10,
     }
-    MIN_SCORE = 3
+    MIN_SCORE = 6                # 3 se badhaya — akela 5M (3) aur 15M (5) ab alert
+                                 # nahi banate. 30M (6), 1H (8), ya multi-TF combo
+                                 # (5M+15M=6, 15M+30M=7, 30M+1H=9) hi paas hote hain.
 
     # Strike gaps per segment
     STRIKE_GAP = {
@@ -436,8 +438,11 @@ def detect_s6(df: pd.DataFrame, tf: str) -> dict | None:
     blast_up  = last["close"] > last["bb_upper"]
     blast_dn  = last["close"] < last["bb_lower"]
 
-    # Squeeze(-1) + Flat(-5to-1) + Blast(0) — volume bonus mein
-    if not (squeeze and flat_bb and (blast_up or blast_dn)):
+    # Squeeze(-1) + Flat(-5to-1) + Blast(0) + VOLUME — chaaron zaroori
+    # Volume ab MANDATORY hai (pehle sirf bonus tha). Bina volume ke blast
+    # aksar fake nikalta hai — bhaav band ke bahar to jaata hai par usme dum
+    # nahi hota. Isi wajah se alerts ki baadh aa rahi thi.
+    if not (squeeze and flat_bb and vol_spike and (blast_up or blast_dn)):
         return None
 
     # ── 4. Pivot Check (PP should be below upper band) ────────────
