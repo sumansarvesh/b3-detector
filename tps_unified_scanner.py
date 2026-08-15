@@ -662,6 +662,31 @@ def get_current_price(instrument_key: str) -> float | None:
         logger.error(f"LTP fetch error {instrument_key}: {e}")
     return None
 
+def get_spot_ltp(instrument_key: str) -> float | None:
+    """
+    Underlying ka LTP — OTM strikes nikalne ke liye.
+
+    BUG FIX: pehle ikey.replace("NSE_FO", "NSE_EQ") kiya jaata tha, yaani
+    "NSE_FO|RELIANCE" se "NSE_EQ|RELIANCE" banta tha. Lekin Upstox ke NSE_EQ
+    keys SYMBOL ke nahi, ISIN ke hote hain (NSE_EQ|INE002A01018). Isliye
+    candle fetch hamesha None laut'ta tha aur har stock skip ho jaata tha —
+    post-market watchlist aur money printer dono me "0 found" ka yahi karan.
+
+    Ab market-quote/ltp endpoint use karte hain jo FO key pe seedha kaam
+    karta hai. Fail ho to 1H candle wala purana tarika fallback me rehta hai.
+    """
+    ltp = get_current_price(instrument_key)
+    if ltp:
+        return ltp
+    try:
+        df = fetch_upstox_candles(instrument_key, "1h")
+        if df is not None and len(df) >= 5:
+            return float(df.iloc[-1]["close"])
+    except Exception:
+        pass
+    return None
+
+
 def round_to_strike(price: float, gap: int) -> int:
     """Price ko nearest strike pe round karo"""
     return int(round(price / gap) * gap)
@@ -921,7 +946,8 @@ def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
         logger.warning("[STOCKS] Token missing — fallback to default list")
         return _get_fallback_stocks(top_n)
 
-    scored = []
+    scored   = []
+    fail_log = []
 
     for symbol, gap in NIFTY100_UNIVERSE:
         try:
@@ -932,11 +958,18 @@ def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
             data   = resp.json()
 
             if data.get("status") != "success":
+                # Pehle ye failure chupchaap nigal li jaati thi — isliye pata hi
+                # nahi chalta tha ki ranking kyun fail hui aur 10 fallback stocks
+                # kyun scan ho rahe hain.
+                if len(fail_log) < 3:
+                    fail_log.append(f"{symbol}: {str(data.get('errors', data))[:160]}")
                 time.sleep(0.2)
                 continue
 
             contracts = data.get("data", [])
             if not contracts:
+                if len(fail_log) < 3:
+                    fail_log.append(f"{symbol}: chain khali aayi")
                 time.sleep(0.2)
                 continue
 
@@ -970,8 +1003,17 @@ def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
             continue
 
     if not scored:
-        logger.warning("[STOCKS] Koi data nahi mila — fallback use kar raha hoon")
+        logger.error(f"[STOCKS] ❌ Saare {len(NIFTY100_UNIVERSE)} symbols fail — "
+                     f"sirf {len(_get_fallback_stocks(top_n))} fallback stocks scan honge")
+        for f in fail_log:
+            logger.error(f"[STOCKS]    ↳ {f}")
         return _get_fallback_stocks(top_n)
+
+    if len(scored) < 20:
+        logger.warning(f"[STOCKS] ⚠️ Sirf {len(scored)}/{len(NIFTY100_UNIVERSE)} symbols "
+                       f"se data mila — universe chhota rahega")
+        for f in fail_log:
+            logger.warning(f"[STOCKS]    ↳ {f}")
 
     # Sort by combined score descending — top N lo
     scored.sort(key=lambda x: x["score"], reverse=True)
@@ -1258,16 +1300,16 @@ def run_post_market_watchlist():
 
     for (symbol, ikey, opt_base, opt_exch, gap) in active_stocks:
         try:
-            spot_key = ikey.replace("NSE_FO", "NSE_EQ")
-            df_ltp   = fetch_upstox_candles(spot_key, "1h")
-            if df_ltp is None or len(df_ltp) < 5:
+            ltp = get_spot_ltp(ikey)
+            if not ltp:
+                logger.warning(f"[📋 Post-Market] {symbol}: LTP nahi mila — skip")
                 time.sleep(0.3)
                 continue
 
-            ltp      = float(df_ltp.iloc[-1]["close"])
             otm_list = get_nearest_expiry_options(opt_base, opt_exch, ltp, gap)
 
             if not otm_list:
+                logger.warning(f"[📋 Post-Market] {symbol}: OTM options nahi mile — skip")
                 time.sleep(0.3)
                 continue
 
@@ -1434,13 +1476,11 @@ def _run_superflat_on_demand():
 
         for (symbol, ikey, opt_base, opt_exch, gap) in active:
             try:
-                spot_key = ikey.replace("NSE_FO", "NSE_EQ")
-                df_ltp   = fetch_upstox_candles(spot_key, "1h")
-                if df_ltp is None or len(df_ltp) < 5:
+                ltp = get_spot_ltp(ikey)
+                if not ltp:
                     time.sleep(0.3)
                     continue
 
-                ltp      = float(df_ltp.iloc[-1]["close"])
                 otm_list = get_nearest_expiry_options(opt_base, opt_exch, ltp, gap)
                 if not otm_list:
                     time.sleep(0.3)
@@ -2031,13 +2071,12 @@ def run_money_printer_scanner(active_stocks: list):
     for (symbol, ikey, opt_base, opt_exch, gap) in active_stocks:
         try:
             # Spot se LTP lo (sirf OTM strikes nikalne ke liye)
-            spot_key = ikey.replace("NSE_FO", "NSE_EQ")
-            df_ltp   = fetch_upstox_candles(spot_key, "1h")
-            if df_ltp is None or len(df_ltp) < 5:
+            ltp = get_spot_ltp(ikey)
+            if not ltp:
+                logger.warning(f"[💰 MONEY PRINTER] {symbol}: LTP nahi mila — skip")
                 time.sleep(0.3)
                 continue
 
-            ltp      = float(df_ltp.iloc[-1]["close"])
             otm_list = get_nearest_expiry_options(opt_base, opt_exch, ltp, gap)
 
             if not otm_list:
