@@ -60,6 +60,10 @@ class PARAMS:
     MARUBOZU_WICK     = 0.10
     RSI_PERIOD        = 9
     SCAN_INTERVAL_SEC = 300      # 5 min
+    POST_MARKET_HOUR  = 17       # 5 PM — post-market watchlist scan
+                                 # BUG FIX: ye define hi nahi tha, isliye scheduler
+                                 # har cycle me AttributeError pe crash karta tha aur
+                                 # watchlist kabhi apne aap nahi chalti thi
     TIMEFRAMES        = ["5m", "15m", "30m", "1h"]
     OTM_STRIKES       = 2        # Upstox (Indian) options
     MIN_VOLUME        = 100      # illiquid contract floor (S9 entry gate)
@@ -648,18 +652,38 @@ _option_cache_time = {}
 OPTION_CACHE_SECONDS = 3600  # 1 hour
 
 def get_current_price(instrument_key: str) -> float | None:
-    """LTP fetch karo Upstox se"""
+    """
+    LTP fetch karo Upstox se.
+
+    BUG FIX: pehle seedha list(d.keys())[0] kar dete the. Upstox chhutti ke din
+    (ya galat instrument key pe) status=success ke saath KHALI data bhej deta hai,
+    aur tab ye line "list index out of range" pe crash karti thi — har symbol pe,
+    har cycle me. Ab khali data ko saaf-saaf handle karte hain.
+    """
     try:
         encoded = requests.utils.quote(instrument_key, safe='')
         url     = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded}"
         resp    = requests.get(url, headers=upstox_headers(), timeout=10)
         data    = resp.json()
-        if data.get("status") == "success":
-            d = data["data"]
-            key = list(d.keys())[0]
-            return float(d[key]["last_price"])
+
+        if data.get("status") != "success":
+            logger.warning(f"[LTP] {instrument_key}: {str(data.get('errors', data))[:150]}")
+            return None
+
+        d = data.get("data") or {}
+        if not d:
+            logger.info(f"[LTP] {instrument_key}: khali data (market band ya key galat)")
+            return None
+
+        row = next(iter(d.values()), None)
+        if not row or row.get("last_price") in (None, ""):
+            logger.info(f"[LTP] {instrument_key}: last_price nahi mila")
+            return None
+
+        return float(row["last_price"])
+
     except Exception as e:
-        logger.error(f"LTP fetch error {instrument_key}: {e}")
+        logger.error(f"[LTP] fetch error {instrument_key}: {e}")
     return None
 
 def get_spot_ltp(instrument_key: str) -> float | None:
@@ -926,6 +950,12 @@ _active_stocks_cache = []
 _active_stocks_time  = 0
 ACTIVE_STOCKS_REFRESH = 3600 * 4  # 4 ghante mein refresh (market ke doran)
 
+# Ranking fail hone pe kitni der dobara koshish na karein.
+# Bina iske: fail hone pe cache set nahi hota, to HAR 5-min cycle me 105 API
+# calls dobara jaati hain — chhutti ke din poora din bekaar ka rate-limit kharch.
+_rank_fail_time      = 0
+RANK_RETRY_SECONDS   = 900   # 15 min
+
 def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
     """
     Nifty 100 se top N stocks fetch karo jo:
@@ -933,12 +963,19 @@ def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
     - Pichhle 1-2 hafte mein active hain
     Returns: [(symbol, instrument_key, option_base, exchange, strike_gap), ...]
     """
-    global _active_stocks_cache, _active_stocks_time
+    global _active_stocks_cache, _active_stocks_time, _rank_fail_time
 
     now_ts = time.time()
     if _active_stocks_cache and (now_ts - _active_stocks_time) < ACTIVE_STOCKS_REFRESH:
         logger.info(f"[STOCKS] Cache use kar raha hoon — {len(_active_stocks_cache)} stocks")
         return _active_stocks_cache
+
+    # Abhi-abhi fail hua tha? 105 calls dobara mat maaro
+    if _rank_fail_time and (now_ts - _rank_fail_time) < RANK_RETRY_SECONDS:
+        mins = int((RANK_RETRY_SECONDS - (now_ts - _rank_fail_time)) / 60)
+        logger.info(f"[STOCKS] Ranking abhi fail hui thi — {mins} min baad retry, "
+                    f"tab tak fallback list")
+        return _get_fallback_stocks(top_n)
 
     logger.info("[STOCKS] Nifty 100 active stocks fetch kar raha hoon (OI+Volume)...")
 
@@ -1007,6 +1044,7 @@ def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
                      f"sirf {len(_get_fallback_stocks(top_n))} fallback stocks scan honge")
         for f in fail_log:
             logger.error(f"[STOCKS]    ↳ {f}")
+        _rank_fail_time = now_ts
         return _get_fallback_stocks(top_n)
 
     if len(scored) < 20:
@@ -1031,6 +1069,7 @@ def fetch_active_nifty100_stocks(top_n: int = 100) -> list:
 
     _active_stocks_cache = result  # Top N stocks (default 100)
     _active_stocks_time  = now_ts
+    _rank_fail_time      = 0
     return result
 
 def _get_fallback_stocks(top_n: int) -> list:
@@ -2315,7 +2354,12 @@ def scheduler():
             else:
                 logger.info(f"[UPSTOX] Market closed. {now.strftime('%H:%M IST')}")
 
-            # ── Post-Market Watchlist Scan (5:00 PM Weekday) ──
+        except Exception as e:
+            logger.error(f"[SCHEDULER] Scan error: {e}")
+
+        # ── Post-Market Watchlist Scan (5:00 PM Weekday) ──
+        # Alag try me — yahan koi dikkat ho to upar wale scanners na ruken
+        try:
             global _post_market_done_date
             today = now.date()
             is_post_market_time = (hour == PARAMS.POST_MARKET_HOUR and
@@ -2325,9 +2369,8 @@ def scheduler():
                 logger.info("[SCHEDULER] 5 PM — Post-Market scan trigger")
                 run_post_market_watchlist()
                 _post_market_done_date = today
-
         except Exception as e:
-            logger.error(f"[SCHEDULER] Error: {e}")
+            logger.error(f"[SCHEDULER] Post-market error: {e}")
 
         time.sleep(PARAMS.SCAN_INTERVAL_SEC)
 
