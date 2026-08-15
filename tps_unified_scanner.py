@@ -128,30 +128,80 @@ def send_telegram(message: str):
 # RAILWAY TOKEN UPDATE
 # ═══════════════════════════════════════════════════════════════════
 def update_railway_token(new_token: str) -> bool:
+    """
+    Railway ki Variables me UPSTOX_ACCESS_TOKEN save karo.
+
+    Railway ke do tarah ke token hote hain aur DONO ka header alag hai:
+      • Account / Team token → Authorization: Bearer <token>
+      • Project token        → Project-Access-Token: <token>
+    Pehle Bearer, phir Project-Access-Token — dono endpoints pe.
+
+    Har failure ab log me asli wajah ke saath aati hai, warna pata hi nahi
+    chalta ki permission ka masla hai, ID ka, ya token ke type ka.
+    """
     if not RAILWAY_API_TOKEN:
+        logger.error("[RAILWAY] RAILWAY_API_TOKEN set nahi hai")
         return False
+
+    missing = [n for n, v in [
+        ("RAILWAY_PROJECT_ID", RAILWAY_PROJECT_ID),
+        ("RAILWAY_SERVICE_ID", RAILWAY_SERVICE_ID),
+        ("RAILWAY_ENVIRONMENT_ID", RAILWAY_ENVIRONMENT_ID),
+    ] if not v]
+    if missing:
+        logger.error(f"[RAILWAY] ye variables khali hain: {missing}")
+        return False
+
+    # environmentId UUID hona chahiye, naam nahi
+    if RAILWAY_ENVIRONMENT_ID.lower() in ("production", "staging", "development"):
+        logger.error(f"[RAILWAY] RAILWAY_ENVIRONMENT_ID me naam '{RAILWAY_ENVIRONMENT_ID}' "
+                     f"pada hai — UUID chahiye (browser URL me environmentId= ke baad wali ID)")
+        return False
+
     query = """
     mutation variableUpsert($input: VariableUpsertInput!) {
       variableUpsert(input: $input)
     }
     """
-    try:
-        resp = requests.post(
-            "https://backboard.railway.app/graphql/v2",
-            headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}", "Content-Type": "application/json"},
-            json={"query": query, "variables": {"input": {
-                "projectId": RAILWAY_PROJECT_ID,
-                "serviceId": RAILWAY_SERVICE_ID,
-                "environmentId": RAILWAY_ENVIRONMENT_ID,
-                "name": "UPSTOX_ACCESS_TOKEN",
-                "value": new_token
-            }}},
-            timeout=30
-        )
-        return "errors" not in resp.json()
-    except Exception as e:
-        logger.error(f"Railway update error: {e}")
-        return False
+    payload = {"query": query, "variables": {"input": {
+        "projectId":     RAILWAY_PROJECT_ID,
+        "serviceId":     RAILWAY_SERVICE_ID,
+        "environmentId": RAILWAY_ENVIRONMENT_ID,
+        "name":          "UPSTOX_ACCESS_TOKEN",
+        "value":         new_token,
+    }}}
+
+    attempts = [
+        ("account token", {"Authorization": f"Bearer {RAILWAY_API_TOKEN}"}),
+        ("project token", {"Project-Access-Token": RAILWAY_API_TOKEN}),
+    ]
+    endpoints = ["https://backboard.railway.com/graphql/v2",
+                 "https://backboard.railway.app/graphql/v2"]
+
+    for label, auth in attempts:
+        for url in endpoints:
+            try:
+                resp = requests.post(
+                    url,
+                    headers={"Content-Type": "application/json", **auth},
+                    json=payload, timeout=30
+                )
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"raw": resp.text[:300]}
+
+                if resp.status_code == 200 and "errors" not in data:
+                    logger.info(f"[RAILWAY] ✅ Variable updated ({label})")
+                    return True
+
+                logger.error(f"[RAILWAY] ❌ {label} → HTTP {resp.status_code} | "
+                             f"{str(data)[:300]}")
+            except Exception as e:
+                logger.error(f"[RAILWAY] ❌ {label} → {e}")
+
+    logger.error("[RAILWAY] Saare tarike fail — upar wali error lines dekhein")
+    return False
 
 # ═══════════════════════════════════════════════════════════════════
 # UPSTOX TOKEN EXCHANGE
