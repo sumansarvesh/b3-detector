@@ -52,9 +52,20 @@ from s9_detector import S9Engine
 class PARAMS:
     BB_PERIOD         = 20
     BB_STD            = 2
-    SQUEEZE_MULT      = 0.7
+    SQUEEZE_MULT      = 0.7      # NOTE: Money Printer aur Super Flat abhi bhi
+                                 # isी value ko use karte hain — S6 alag constants
+                                 # neeche use karta hai, taaki S6 loosen karne se
+                                 # unabhi-test-hue-nahi detectors na hilein
     FLAT_CANDLES      = 4        # min 4 candles flat
-    FLAT_THRESHOLD    = 0.002    # 0.2%
+    FLAT_THRESHOLD    = 0.002    # 0.2% — Money Printer/Super Flat isी ko use karte hain
+
+    # S6-specific tightness (16 Aug 2026 — S6 loosened, baaki detectors nahi)
+    # Wajah: shared FLAT_THRESHOLD/SQUEEZE_MULT badalte to Money Printer aur
+    # Super Flat bhi loose ho jaate — jinka aaj hi AttributeError bug fix hua
+    # hai aur jo abhi tak ek baar bhi live test nahi hue. S6 apne alag
+    # thresholds use karega, baaki do abhi purani (tight) values pe rahenge.
+    S6_FLAT_THRESHOLD = 0.003    # 0.2% → 0.3%  (loose)
+    S6_SQUEEZE_MULT   = 0.8      # 0.7  → 0.8   (loose — squeeze aasani se pass hoga)
     VOL_MULT          = 1.5
     VOL_PERIOD        = 20
     MARUBOZU_WICK     = 0.10
@@ -70,6 +81,18 @@ class PARAMS:
     S9_TOP_STOCKS     = 50       # S9 universe: top N active N100 stocks
     S9_CLOSE_BUFFER   = 20       # candle close ke kitne sec baad S9 chale
     DELTA_OTM_STRIKES = 4        # BTC/ETH — 4 strikes away
+
+    # Super Flat thresholds (1H option chart)
+    # BUG FIX: ye 5 kabhi PARAMS me the hi nahi (repo me shuru se hi missing),
+    # jabki detect_super_flat() aur detect_money_printer() inhe use karte hain.
+    # Har baar AttributeError aata tha, per-symbol try/except chupchaap nigal
+    # leta tha — isliye Super Flat aur Money Printer ne AAJ TAK ek bhi setup
+    # detect nahi kiya, market conditions ki wajah se nahi, is crash ki wajah se.
+    SUPER_FLAT_TH   = 0.0012   # 0.12% — lines kitni flat honi chahiye
+    BB_TIGHT_TH     = 0.035    # 3.5% bandwidth
+    LINES_CLOSE_TH  = 0.018    # 1.8% UBB↔SMA / SMA↔LBB
+    VWAP_CLOSE_TH   = 0.006    # 0.6% VWAP↔SMA
+    BALD_MIN_RATIO  = 0.68     # 68% body = bald candle (Money Printer)
 
     TF_SCORE = {
         "5m": 3, "15m": 5, "30m": 6, "1h": 8,
@@ -427,13 +450,22 @@ def detect_s6(df: pd.DataFrame, tf: str) -> dict | None:
     # avg BW: candles -22 to -2 (blast exclude)
     avg_bw  = df["bb_width"].iloc[-(PARAMS.VOL_PERIOD + 2):-1].mean()
     # Blast se pehle wala candle squeeze mein tha?
-    squeeze = float(pre["bb_width"]) < avg_bw * PARAMS.SQUEEZE_MULT
+    # S6-specific SQUEEZE_MULT — dhyan rahe: agar consolidation lamba ho (4 se
+    # zyada candles tight), to avg_bw khud chhota ho jaata hai (kyunki wo bhi
+    # isi 22-candle lookback ka hissa hai), jisse squeeze condition ULTA
+    # kathin ho jaati thi. Loose mult (0.8) isko counter karta hai.
+    squeeze = float(pre["bb_width"]) < avg_bw * PARAMS.S6_SQUEEZE_MULT
 
     # ── 2. Flat Bands — Candles -5 to -1 ─────────────────────────
     # Blast candle exclude — woh toh bahar ja raha hai
-    flat_bb = (pct_range(prev_flat["sma20"])    < PARAMS.FLAT_THRESHOLD and
-               pct_range(prev_flat["bb_upper"]) < PARAMS.FLAT_THRESHOLD and
-               pct_range(prev_flat["bb_lower"]) < PARAMS.FLAT_THRESHOLD)
+    # NOTE: ye check sirf AAKHRI FLAT_CANDLES (4) candles dekhta hai — agar
+    # consolidation isse LAMBA bhi ho (5, 6, 7 candles flat), wo apne aap pass
+    # ho jaata hai, kyunki hum sirf sabse tight (chhota) window dekh rahe hain.
+    # "4 ya usse zyada flat ho to chalega" — ye already sach hai, koi change
+    # nahi chahiye is hisse me.
+    flat_bb = (pct_range(prev_flat["sma20"])    < PARAMS.S6_FLAT_THRESHOLD and
+               pct_range(prev_flat["bb_upper"]) < PARAMS.S6_FLAT_THRESHOLD and
+               pct_range(prev_flat["bb_lower"]) < PARAMS.S6_FLAT_THRESHOLD)
 
     # ── 3. Blast — Last Candle (0) ────────────────────────────────
     # Volume — optional (bonus), not mandatory
@@ -449,28 +481,44 @@ def detect_s6(df: pd.DataFrame, tf: str) -> dict | None:
     if not (squeeze and flat_bb and vol_spike and (blast_up or blast_dn)):
         return None
 
-    # ── 4. Pivot Check (PP should be below upper band) ────────────
-    pivot      = float(last["pivot"])
-    # Pre-blast candle ka BB use karo pivot check ke liye
-    # (blast candle mein BB already break ho chuka hai)
+    # ── 4. Pre-blast bands (sweep check ke liye — pivot S9 me hai, yahan nahi) ─
+    # Pre-blast candle ka BB use karo — blast candle mein BB already toot chuka
     bb_upper   = float(pre["bb_upper"])
     bb_lower   = float(pre["bb_lower"])
-    # PP pre-blast UBB ke neeche hona chahiye — 2% buffer
-    pivot_ok   = pivot < bb_upper * 1.02
 
-    # ── 5. VWAP + SMA20 + EMA5 Flat Check (optional — SUPER DUPER) ─
-    vwap_flat  = pct_range(prev_flat["vwap"])  < PARAMS.FLAT_THRESHOLD if "vwap" in prev_flat.columns else False
-    ema5_flat  = pct_range(prev_flat["ema5"])  < PARAMS.FLAT_THRESHOLD if "ema5" in prev_flat.columns else False
-    sma_flat   = pct_range(prev_flat["sma20"]) < PARAMS.FLAT_THRESHOLD
+    # ── 5. Liquidity Sweep — ASLI paribhasha (16 Aug 2026 se) ─────
+    # Pehle sirf "band ke 0.1% andar aa gaya" ko sweep maan lete the — wo
+    # asli sweep nahi tha, sirf price ka band ke paas hona tha, jo squeeze
+    # ke dauraan lagbhag hamesha sach hota hai.
+    #
+    # Ab asli ICT-style sweep: kisi candle ki high/low band ke PAAR jaani
+    # chahiye (wick), AUR USI candle ka close wapas band ke ANDAR aana
+    # chahiye — yaani liquidity le gaya (stop-hunt) aur turant reject
+    # (rejection) — trap ban gaya.
+    pre_blast = df.iloc[-(PARAMS.FLAT_CANDLES + 2):-1]
+
+    swept_high = pre_blast[(pre_blast["high"] > bb_upper) &
+                           (pre_blast["close"] <= bb_upper)]
+    swept_low  = pre_blast[(pre_blast["low"]  < bb_lower) &
+                           (pre_blast["close"] >= bb_lower)]
+
+    liq_sweep = len(swept_low) > 0 if blast_up else len(swept_high) > 0
+
+    # ── 6. SELL-SIDE HARD GATE ──────────────────────────────────────
+    # Bearish trade SIRF tab bane jab liquidity sweep hua ho (upar wali asli
+    # paribhasha se). Pivot check yahan se hata diya — pivot ka kaam S9 karta
+    # hai (16 Aug 2026), S6 me dobara pivot nahi chahiye.
+    if blast_dn and not liq_sweep:
+        return None
+
+    # ── 7. VWAP + SMA20 + EMA5 Flat Check (optional — SUPER DUPER) ─
+    vwap_flat  = pct_range(prev_flat["vwap"])  < PARAMS.S6_FLAT_THRESHOLD if "vwap" in prev_flat.columns else False
+    ema5_flat  = pct_range(prev_flat["ema5"])  < PARAMS.S6_FLAT_THRESHOLD if "ema5" in prev_flat.columns else False
+    sma_flat   = pct_range(prev_flat["sma20"]) < PARAMS.S6_FLAT_THRESHOLD
     all_flat   = vwap_flat and ema5_flat and sma_flat  # SUPER DUPER condition
 
-    # ── 6. Liquidity Sweep Check (1-4 candles before blast) ───────
-    # Blast se pehle 1-4 candles mein price ne bb_lower touch kiya ho
-    pre_blast  = df.iloc[-(PARAMS.FLAT_CANDLES + 2):-1]
-    liq_sweep  = (pre_blast["low"] <= bb_lower * 1.001).any() if blast_up else                  (pre_blast["high"] >= bb_upper * 0.999).any()
-
-    # SUPER DUPER = all_flat + liq_sweep + pivot_ok
-    super_duper = all_flat and liq_sweep and pivot_ok
+    # SUPER DUPER = all_flat + liq_sweep (pivot hata diya — S9 ka kaam hai)
+    super_duper = all_flat and liq_sweep
 
     direction = "BULLISH 🟢" if blast_up else "BEARISH 🔴"
 
@@ -485,8 +533,6 @@ def detect_s6(df: pd.DataFrame, tf: str) -> dict | None:
         "bb_upper":    round(bb_upper, 4),
         "bb_lower":    round(bb_lower, 4),
         "bb_width":    round(float(last["bb_width"]) * 100, 3),
-        "pivot":       round(pivot, 4),
-        "pivot_ok":    pivot_ok,
         "vwap":        round(float(last["vwap"]), 4) if "vwap" in last else None,
         "ema5":        round(float(last["ema5"]), 4) if "ema5" in last else None,
         "all_flat":    all_flat,
@@ -530,7 +576,6 @@ def format_alert(symbol: str, signals: dict, score: int, source: str, option_typ
     super_duper = any(s.get("super_duper", False) for s in signals.values())
     all_flat    = any(s.get("all_flat", False) for s in signals.values())
     liq_sweep   = any(s.get("liq_sweep", False) for s in signals.values())
-    pivot_ok    = sig.get("pivot_ok", True)
 
     # Header
     if super_duper:
@@ -544,7 +589,6 @@ def format_alert(symbol: str, signals: dict, score: int, source: str, option_typ
         f"{direction}\n"
         f"⏰ Setup: <b>{tfs_str}</b>\n"
         f"💰 Price: <b>{sig['close']}</b>\n"
-        f"📍 Pivot (PP): <b>{sig.get('pivot', 'N/A')}</b> {'✅' if pivot_ok else '⚠️ PP high!'}\n"
     )
 
     if sig.get("vwap"):
@@ -565,7 +609,6 @@ def format_alert(symbol: str, signals: dict, score: int, source: str, option_typ
         msg += "\n🏆 <b>SUPER DUPER CONDITIONS:</b>\n"
         msg += f"  {'✅' if all_flat else '❌'} VWAP + SMA20 + EMA5 — Sab Flat\n"
         msg += f"  {'✅' if liq_sweep else '❌'} Liquidity Sweep (blast se pehle)\n"
-        msg += f"  {'✅' if pivot_ok else '❌'} Pivot PP — Band ke neeche\n"
         if vol_spike_any:
             msg += "  ⭐ <b>BONUS</b> — Volume Spike confirmed!\n"
     elif all_flat or liq_sweep or vol_spike_any:
@@ -574,8 +617,6 @@ def format_alert(symbol: str, signals: dict, score: int, source: str, option_typ
             msg += "  ✅ VWAP + SMA20 + EMA5 Flat\n"
         if liq_sweep:
             msg += "  ✅ Liquidity Sweep detected\n"
-        if pivot_ok:
-            msg += "  ✅ Pivot PP — Sahi position\n"
         if vol_spike_any:
             msg += "  ⭐ <b>BONUS</b> — Volume Spike confirmed!\n"
 
@@ -2325,6 +2366,7 @@ def _run_s9_on_demand():
         )
     except Exception as e:
         send_telegram(f"\u274c S9 Scan Error: {e}")
+
 
 
 def scheduler():
