@@ -33,6 +33,7 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 from threading import Thread
 import pytz
+import http.server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,15 +144,48 @@ scanner_paused = False
 # ═══════════════════════════════════════════════════════════════════
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        logger.error("[TG] TELEGRAM_BOT_TOKEN ya TELEGRAM_CHAT_ID missing")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payloads = [
+        {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True},
+        {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True},
+    ]
+    last_err = ""
+    for body in payloads:
+        try:
+            resp = requests.post(url, json=body, timeout=12)
+            data = resp.json() if resp.content else {}
+            if data.get("ok"):
+                return True
+            last_err = str(data.get("description") or f"HTTP {resp.status_code}")
+        except Exception as e:
+            last_err = str(e)
+    logger.error(f"[TG] send fail: {last_err[:240]}")
+    return False
+
+def railway_keepalive():
+    """Railway web service PORT pe 200 de — warna healthcheck fail / sleep."""
+    port = int(os.environ.get("PORT", "8080"))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"tps scanner live")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            return
+
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10
-        )
+        http.server.HTTPServer(("0.0.0.0", port), Handler).serve_forever()
     except Exception as e:
-        logger.error(f"Telegram error: {e}")
+        logger.error(f"[KEEPALIVE] {e}")
 
 # ═══════════════════════════════════════════════════════════════════
 # RAILWAY TOKEN UPDATE
@@ -1349,6 +1383,7 @@ def run_delta_scanner():
 # ═══════════════════════════════════════════════════════════════════
 
 _post_market_done_date = None  # Track karo aaj scan hua ya nahi
+_session_arm_date = None
 
 def run_post_market_watchlist():
     """
@@ -1649,6 +1684,7 @@ def telegram_bot():
                         f"/scan_s9 — S9 Pivot Confluence Blast scan\n"
                         f"/scan_mp — Money Printer scan\n"
                         f"/scan_superflat — Super Flat scan\n"
+                        f"/ping — bot live check\n"
                         f"/help — All commands"
                     )
 
@@ -1659,6 +1695,15 @@ def telegram_bot():
                 elif text == "/resume":
                     scanner_paused = False
                     send_telegram("▶️ <b>Scanner Resumed!</b>")
+
+                elif text == "/ping":
+                    tok = "set" if UPSTOX_ACCESS_TOKEN else "missing"
+                    send_telegram(
+                        f"pong — Railway scanner live\n"
+                        f"{'⏸ paused' if scanner_paused else '▶️ scanning'}\n"
+                        f"Upstox: {tok}\n"
+                        f"{datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}"
+                    )
 
                 # ── CUSTOM SCAN COMMANDS ─────────────────────────────
                 elif text == "/scan_s9":
@@ -2370,6 +2415,7 @@ def _run_s9_on_demand():
 
 
 def scheduler():
+    global _session_arm_date, _post_market_done_date
     while True:
         if scanner_paused:
             time.sleep(60)
@@ -2396,13 +2442,21 @@ def scheduler():
             else:
                 logger.info(f"[UPSTOX] Market closed. {now.strftime('%H:%M IST')}")
 
+            if is_weekday and hour == 9 and minute < 16:
+                if _session_arm_date != now.date():
+                    send_telegram(
+                        "📡 <b>TPS armed</b> — market open.\n"
+                        "Phone alerts on. Desk kholna zaroori nahi.\n"
+                        f"{now.strftime('%d-%m-%Y %H:%M IST')}"
+                    )
+                    _session_arm_date = now.date()
+
         except Exception as e:
             logger.error(f"[SCHEDULER] Scan error: {e}")
 
         # ── Post-Market Watchlist Scan (5:00 PM Weekday) ──
         # Alag try me — yahan koi dikkat ho to upar wale scanners na ruken
         try:
-            global _post_market_done_date
             today = now.date()
             is_post_market_time = (hour == PARAMS.POST_MARKET_HOUR and
                                     minute < 10)  # 5:00-5:09 window
@@ -2426,17 +2480,19 @@ if __name__ == "__main__":
     logger.info(f"Time: {datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}")
     logger.info("=" * 60)
 
-    send_telegram(
-        "🚀 <b>TPS Unified Scanner v2.0 Started!</b>\n\n"
-        "🌐 BTC + ETH (Delta Exchange)\n"
+    Thread(target=railway_keepalive, daemon=True).start()
+
+    ok = send_telegram(
+        "🚀 <b>TPS Railway scanner LIVE</b>\n\n"
+        "Phone alerts on — desk kholna zaroori nahi.\n"
+        "🌐 BTC + ETH (24x7)\n"
         "🇮🇳 Nifty · Sensex · Gold · SilverM · Crude · NatGas\n"
-        "📈 + 2 OTM CE/PE (current expiry) — sabhi segments\n"
-        "📊 Top 20 Active N100 Stocks (OI+Vol) + options\n"
-        "⏰ TF: 5M · 15M · 30M · 1H\n\n"
-        f"💰 Money Printer: 1H | Active N100 Stocks\n"
-        f"⭐ S9 Pivot Confluence Blast: ON (clock-aligned 5M grid)\n"
+        "📈 S6 · S9 · Super Flat · Money Printer\n"
+        "Telegram: /status · /ping · /scan_s6 · /scan_s9\n\n"
         f"🕐 {datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}"
     )
+    if not ok:
+        logger.error("[TG] Startup ping fail — token/chat_id Console me check karo")
 
     Thread(target=telegram_bot, daemon=True).start()
     Thread(target=s9_scheduler, daemon=True).start()

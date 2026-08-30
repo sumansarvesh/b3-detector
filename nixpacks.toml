@@ -3,3 +3,6 @@ nixPkgs = ["python311"]
 
 [phases.install]
 cmds = ["pip install --only-binary=:all: -r requirements.txt"]
+
+[start]
+cmd = "python3 tps_unified_scanner.py"
