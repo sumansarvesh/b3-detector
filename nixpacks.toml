@@ -5,4 +5,4 @@ nixPkgs = ["python311"]
 cmds = ["pip install --only-binary=:all: -r requirements.txt"]
 
 [start]
-cmd = "python3 tps_unified_scanner.py"
+cmd = "python3 s9_scanner.py"

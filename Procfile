@@ -1,2 +1,1 @@
-web: python3 tps_unified_scanner.py
-worker: python3 tps_unified_scanner.py
+web: python3 s9_scanner.py
