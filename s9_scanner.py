@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 S9 Scanner — Pivot Confluence Blast (Multi-Exchange)
 =====================================================
