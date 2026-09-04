@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Railway
+.railway/
+
+# Backup files
+*.bak
+*.orig
+
+# Secrets / tokens
+*.token
+token.json
