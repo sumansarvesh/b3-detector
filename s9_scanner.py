@@ -21,7 +21,8 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
+from typing import Optional, Union
 from threading import Thread
 import pytz
 import http.server
@@ -123,7 +124,7 @@ _mcx_expiry_date: str = ""      # current MCX monthly expiry
 # TF cache: (sym, tf) -> (timestamp, DataFrame)
 _tf_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
 _1d_cache: dict[str, tuple[str, pd.DataFrame]] = {}   # sym -> (date_str, df)
-_weekly_pp_cache: dict[str, tuple[str, float | None]] = {}
+_weekly_pp_cache: dict[str, tuple[str, Optional[float]]] = {}
 
 UPSTOX_MASTER: list[dict] = []
 _upstox_master_ts: float = 0
@@ -137,7 +138,7 @@ _DELTA_API = "https://api.india.delta.exchange/v2"
 _DELTA_CDN = "https://cdn.india.deltaex.org/v2"
 
 
-def _delta_get(url: str) -> dict | None:
+def _delta_get(url: str) -> Optional[dict]:
     try:
         r = requests.get(url, timeout=15, headers={"Accept": "application/json"})
         return r.json() if r.ok else None
@@ -146,7 +147,7 @@ def _delta_get(url: str) -> dict | None:
         return None
 
 
-def _delta_candles(symbol: str, tf: str, lookback: int = 120) -> pd.DataFrame | None:
+def _delta_candles(symbol: str, tf: str, lookback: int = 120) -> Optional[pd.DataFrame]:
     res_map = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "1d"}
     secs = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "1d": 86400}
     end = int(time.time())
@@ -213,7 +214,7 @@ _upstox_master_ts: float = 0
 _UPSTOX_MASTER_TTL = 6 * 3600
 
 
-def _upstox_get(url: str) -> dict | None:
+def _upstox_get(url: str) -> Optional[dict]:
     hdrs = {**_UPSTOX_HDRS}
     if UPSTOX_TOKEN:
         hdrs["Authorization"] = f"Bearer {UPSTOX_TOKEN}"
@@ -225,7 +226,7 @@ def _upstox_get(url: str) -> dict | None:
         return None
 
 
-def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> pd.DataFrame | None:
+def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> Optional[pd.DataFrame]:
     """Fetch 5m candles from Upstox historical API."""
     tf_map = {"5m": "minutes/5", "15m": "minutes/15", "30m": "minutes/30", "1h": "hours/1", "1d": "days/1"}
     interval = tf_map.get(tf, "minutes/5")
@@ -302,7 +303,7 @@ def _load_upstox_master() -> list[dict]:
     return instruments
 
 
-def _resolve_upstox_key(sym_def: dict) -> str | None:
+def _resolve_upstox_key(sym_def: dict) -> Optional[str]:
     """Find the instrument key for a given symbol definition."""
     master = _load_upstox_master()
     if not master:
@@ -368,7 +369,7 @@ def _resolve_upstox_key(sym_def: dict) -> str | None:
     return None
 
 
-def _upstox_candles(sym_def: dict, tf: str = "5m", lookback: int = 120) -> pd.DataFrame | None:
+def _upstox_candles(sym_def: dict, tf: str = "5m", lookback: int = 120) -> Optional[pd.DataFrame]:
     """Fetch candles for any Upstox instrument."""
     key = _resolve_upstox_key(sym_def)
     if not key:
@@ -376,7 +377,7 @@ def _upstox_candles(sym_def: dict, tf: str = "5m", lookback: int = 120) -> pd.Da
     return _upstox_fetch_candles(key, tf, lookback)
 
 
-def _upstox_prev_day_vol(sym_def: dict) -> float | None:
+def _upstox_prev_day_vol(sym_def: dict) -> Optional[float]:
     """Get previous day volume for entry gate."""
     key = _resolve_upstox_key(sym_def)
     if not key:
@@ -425,7 +426,7 @@ def _next_monthly_expiry(base: datetime, roll_days_before: int = 5) -> datetime.
     return last_thu
 
 
-def _current_expiry(seg: str, style: str = "monthly") -> datetime.date | None:
+def _current_expiry(seg: str, style: str = "monthly") -> Optional[datetime.date]:
     """Get the current active expiry date for a segment."""
     now = datetime.now(IST)
     if style == "weekly":
@@ -553,7 +554,7 @@ def _pct_range(s: pd.Series) -> float:
     return 0.0 if not m else float((s.max() - s.min()) / m)
 
 
-def _prev_day_hlcv(df: pd.DataFrame) -> tuple | None:
+def _prev_day_hlcv(df: pd.DataFrame) -> Optional[tuple]:
     try:
         d = df.copy()
         d["_d"] = pd.to_datetime(d["timestamp"]).dt.date
@@ -590,7 +591,7 @@ def _calc_pivots(df: pd.DataFrame) -> dict:
         return {}
 
 
-def _calc_weekly_pp(df_1d: pd.DataFrame | None) -> float | None:
+def _calc_weekly_pp(df_1d: Optional[pd.DataFrame]) -> Optional[float]:
     if df_1d is None or len(df_1d) < 7:
         return None
     try:
@@ -609,7 +610,7 @@ def _calc_weekly_pp(df_1d: pd.DataFrame | None) -> float | None:
         return None
 
 
-def _compute_stars(close: float, pivots: dict, weekly_pp: float | None) -> int:
+def _compute_stars(close: float, pivots: dict, weekly_pp: Optional[float]) -> int:
     stars = 0
     for level, pts in [(pivots.get("PP"), 2), (pivots.get("R1"), 3),
                        (pivots.get("R2"), 4), (pivots.get("R3"), 5)]:
@@ -629,7 +630,7 @@ def _compute_stars(close: float, pivots: dict, weekly_pp: float | None) -> int:
 _CANDLE_TTL = {"5m": 0, "15m": 300, "30m": 600, "1h": 900, "1d": 86400}
 
 
-def fetch_candles(sym_def: dict, tf: str, lookback: int = 120) -> pd.DataFrame | None:
+def fetch_candles(sym_def: dict, tf: str, lookback: int = 120) -> Optional[pd.DataFrame]:
     """Unified candle fetch — Delta for crypto, Upstox for NSE/MCX."""
     src = sym_def.get("src", "delta")
     if src == "delta":
@@ -652,7 +653,7 @@ def fetch_candles(sym_def: dict, tf: str, lookback: int = 120) -> pd.DataFrame |
     return df
 
 
-def _get_1d_cached(sym_def: dict) -> pd.DataFrame | None:
+def _get_1d_cached(sym_def: dict) -> Optional[pd.DataFrame]:
     """Get cached 1d data or fetch fresh."""
     sym = sym_def["sym"]
     hit = _1d_cache.get(sym)
@@ -668,7 +669,7 @@ def _get_1d_cached(sym_def: dict) -> pd.DataFrame | None:
 # S9 DETECTION
 # ═══════════════════════════════════════════════════════════════════
 
-def _blast_up(df: pd.DataFrame) -> dict | None:
+def _blast_up(df: pd.DataFrame) -> Optional[dict]:
     d = _add_indicators(df).dropna().reset_index(drop=True)
     if len(d) < 2:
         return None
@@ -683,7 +684,7 @@ def _blast_up(df: pd.DataFrame) -> dict | None:
     }
 
 
-def _pp_inside_bb(df: pd.DataFrame | None, pp: float, prev_candle: bool = False) -> bool | None:
+def _pp_inside_bb(df: Optional[pd.DataFrame], pp: float, prev_candle: bool = False) -> Optional[bool]:
     if df is None or len(df) < BB_PERIOD + 2:
         return None
     d = _add_indicators(df).dropna()
@@ -709,7 +710,7 @@ def _is_bb_flat(df: pd.DataFrame) -> bool:
 
 
 def _entry_gate(ts: datetime, candle_open: float, candle_close: float, candle_high: float,
-                pd_high: float | None, pd_vol: float | None, day_high: float | None,
+                pd_high: Optional[float], pd_vol: Optional[float], day_high: Optional[float],
                 seg: str) -> tuple[bool, str]:
     open_hr, open_mn = SEGMENT_OPEN.get(seg, (0, 0))
     open_dt = ts.replace(hour=open_hr, minute=open_mn, second=0, microsecond=0)
@@ -734,7 +735,7 @@ def _entry_gate(ts: datetime, candle_open: float, candle_close: float, candle_hi
     return False, "Mid-day gate FAIL"
 
 
-def detect_s9(sym_def: dict, tf: str = "5m") -> dict | None:
+def detect_s9(sym_def: dict, tf: str = "5m") -> Optional[dict]:
     """Run S9 detection on one symbol + timeframe."""
     lookback = 200 if tf == "1d" else 120
     df = fetch_candles(sym_def, tf, lookback)
