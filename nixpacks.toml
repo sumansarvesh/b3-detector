@@ -1,3 +1,4 @@
+# nixpacks.toml
 [phases.setup]
 nixPkgs = ["python311"]
 
@@ -5,4 +6,4 @@ nixPkgs = ["python311"]
 cmds = ["pip install --only-binary=:all: -r requirements.txt"]
 
 [start]
-cmd = "python3 s9_scanner.py"
+cmd = "python3 s9_scanner.py"   # <- B3 se S9 mein change
