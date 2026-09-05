@@ -326,7 +326,7 @@ def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> 
 
 
 def _load_upstox_master() -> list[dict]:
-    """Load Upstox instrument master (cached)."""
+    """Load instruments via authenticated API (no CSV needed)."""
     global _upstox_master_cache, _upstox_master_ts
     now = time.time()
     if _upstox_master_cache and (now - _upstox_master_ts) < _UPSTOX_MASTER_TTL:
@@ -334,87 +334,50 @@ def _load_upstox_master() -> list[dict]:
 
     instruments = []
 
-    # Try public CSV downloads first (no auth required)
-    csv_urls = [
-        ("https://assets.upstox.com/market-quote/instruments/exchange_NSE.csv", "NSE"),
-        ("https://assets.upstox.com/market-quote/instruments/exchange_NSE_FO.csv", "NSE_FO"),
-        ("https://assets.upstox.com/market-quote/instruments/exchange_MCX.csv", "MCX"),
-        ("https://assets.upstox.com/market-quote/instruments/exchange_MCX_FO.csv", "MCX_FO"),
-    ]
+    if not UPSTOX_TOKEN:
+        logger.error("[UPSTOX] No token available — cannot load instruments")
+        return []
 
-    for url, exch in csv_urls:
+    logger.info("[UPSTOX] Fetching instruments via authenticated API...")
+    api_url = "https://api.upstox.com/v2/instruments"
+    hdrs = {**_UPSTOX_HDRS, "Authorization": f"Bearer {UPSTOX_TOKEN}"}
+
+    for segment in ["NSE", "NSE_FO", "MCX", "MCX_FO"]:
         try:
-            logger.info(f"[UPSTOX] Fetching master from {url}")
-            r = requests.get(url, timeout=30, headers=_UPSTOX_HDRS)
-            logger.info(f"[UPSTOX] {exch} status={r.status_code} size={len(r.text)}")
+            r = requests.get(f"{api_url}?segment={segment}", headers=hdrs, timeout=60)
+            logger.info(f"[UPSTOX] {segment}: HTTP {r.status_code}, size={len(r.text)}")
             if not r.ok:
-                logger.warning(f"[UPSTOX] {exch} fetch failed: HTTP {r.status_code}")
+                logger.warning(f"[UPSTOX] {segment} failed: HTTP {r.status_code} {r.text[:200]}")
                 continue
-            text = r.text
-            lines = text.splitlines()
-            if not lines:
-                logger.warning(f"[UPSTOX] {exch} empty response")
+            data = r.json()
+            items = data.get("data", [])
+            if not items:
+                logger.warning(f"[UPSTOX] {segment}: empty data")
                 continue
-            header = [h.strip().strip('"') for h in lines[0].split(",")]
-            idx = {h: i for i, h in enumerate(header)}
-            count = 0
-            for line in lines[1:]:
-                parts = line.split(",")
-                if len(parts) < len(header):
-                    continue
-                def _col(name):
-                    pos = idx.get(name, -1)
-                    return parts[pos].strip().strip('"') if pos >= 0 else ""
+            for item in items:
                 instruments.append({
-                    "key": _col("instrument_key"),
-                    "symbol": _col("trading_symbol"),
-                    "exchange": _col("exchange"),
-                    "instrument_type": _col("instrument_type"),
-                    "option_type": _col("option_type"),
-                    "strike": float(_col("strike_price") or 0),
-                    "expiry": _col("expiry"),
-                    "lot_size": int(_col("lot_size") or 0),
-                    "tick_size": float(_col("tick_size") or 0),
-                    "prev_close": float(_col("last_price") or 0),
+                    "key": item.get("instrument_key", ""),
+                    "symbol": item.get("trading_symbol", ""),
+                    "exchange": item.get("exchange", ""),
+                    "instrument_type": item.get("instrument_type", ""),
+                    "option_type": item.get("option_type", ""),
+                    "strike": float(item.get("strike_price") or 0),
+                    "expiry": item.get("expiry", ""),
+                    "lot_size": int(item.get("lot_size") or 0),
+                    "tick_size": float(item.get("tick_size") or 0),
+                    "prev_close": float(item.get("last_price") or 0),
                 })
-                count += 1
-            logger.info(f"[UPSTOX] {exch} parsed {count} instruments")
+            logger.info(f"[UPSTOX] {segment}: loaded {len(items)} instruments")
         except Exception as e:
-            logger.warning(f"[UPSTOX] Master load failed for {url}: {e}")
+            logger.warning(f"[UPSTOX] {segment} error: {e}")
 
-    # Fallback: try authenticated API if CSV failed
-    if not instruments and UPSTOX_TOKEN:
-        logger.info("[UPSTOX] CSV download failed, trying authenticated API...")
-        try:
-            api_url = "https://api.upstox.com/v2/instruments"
-            hdrs = {**_UPSTOX_HDRS, "Authorization": f"Bearer {UPSTOX_TOKEN}"}
-            for segment in ["NSE", "NSE_FO", "MCX", "MCX_FO"]:
-                try:
-                    r = requests.get(f"{api_url}?segment={segment}", headers=hdrs, timeout=30)
-                    if r.ok:
-                        data = r.json()
-                        for item in data.get("data", []):
-                            instruments.append({
-                                "key": item.get("instrument_key", ""),
-                                "symbol": item.get("trading_symbol", ""),
-                                "exchange": item.get("exchange", ""),
-                                "instrument_type": item.get("instrument_type", ""),
-                                "option_type": item.get("option_type", ""),
-                                "strike": float(item.get("strike_price") or 0),
-                                "expiry": item.get("expiry", ""),
-                                "lot_size": int(item.get("lot_size") or 0),
-                                "tick_size": float(item.get("tick_size") or 0),
-                                "prev_close": float(item.get("last_price") or 0),
-                            })
-                        logger.info(f"[UPSTOX] API {segment}: +{len(data.get('data', []))} instruments")
-                except Exception as e:
-                    logger.warning(f"[UPSTOX] API {segment} failed: {e}")
-        except Exception as e:
-            logger.warning(f"[UPSTOX] Authenticated API fallback failed: {e}")
+    if not instruments:
+        logger.error("[UPSTOX] All segments failed — no instruments loaded")
+        return []
 
     _upstox_master_cache = instruments
     _upstox_master_ts = now
-    logger.info(f"[UPSTOX] Master loaded: {len(instruments)} instruments")
+    logger.info(f"[UPSTOX] Master loaded: {len(instruments)} instruments (API)")
     return instruments
 
 
