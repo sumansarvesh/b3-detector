@@ -12,6 +12,7 @@ Telegram: S9-only alerts with stars + ladder + pivots.
 Blacklist at R3 for stocks only (indices/commodities/crypto keep firing).
 """
 
+from __future__ import annotations
 import os
 import time
 import json
