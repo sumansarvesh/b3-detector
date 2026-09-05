@@ -1,18 +1,19 @@
+from __future__ import annotations
+
 """
 S9 Scanner — Pivot Confluence Blast (Multi-Exchange)
 =====================================================
 Scans:
-- BTCUSD + ETHUSD (Delta Exchange) — 4th far OTM CE/PE
-- Nifty 100 stocks + 2 OTM options (Upstox) — monthly expiry
+- BTC/ETH 4-far-OTM options (Delta Exchange) — CE + PE
+- Nifty 100 stocks — 2-far-OTM options (Upstox) — monthly expiry
 - NIFTY / BANKNIFTY / SENSEX options (Upstox) — weekly expiry
 - MCX commodity options (Upstox) — monthly expiry
 - After 4 PM IST: crypto expiry shifts to next day
 
 Telegram: S9-only alerts with stars + ladder + pivots.
-Blacklist at R3 for stocks only (indices/commodities/crypto keep firing).
+No stock scanning — options only.
 """
 
-from __future__ import annotations
 import os
 import time
 import json
@@ -20,7 +21,8 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
+from typing import Optional, Union
 from threading import Thread
 import pytz
 import http.server
@@ -29,6 +31,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger("S9")
 
 IST = pytz.timezone("Asia/Kolkata")
+UTC = pytz.UTC
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG
@@ -62,14 +65,30 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 NIFTY100: list[tuple[str, int]] = [
     ("RELIANCE", 10), ("TCS", 20), ("HDFCBANK", 5), ("ICICIBANK", 10),
-    ("INFY", 10), ("SBIN", 5), ("BAJFINANCE", 10), ("AXISBANK", 5),
-    ("KOTAKBANK", 10), ("LT", 20), ("BHARTIARTL", 10), ("ITC", 5),
-    ("HINDUNILVR", 20), ("MARUTI", 100), ("TATAMOTORS", 5), ("SUNPHARMA", 20),
-    ("HCLTECH", 10), ("NTPC", 5), ("ONGC", 5), ("POWERGRID", 5),
-    ("TATASTEEL", 2), ("ADANIENT", 20), ("ULTRACEMCO", 50), ("TITAN", 50),
-    ("BAJAJ-AUTO", 50), ("COALINDIA", 5), ("HINDALCO", 5), ("ZOMATO", 2),
-    ("TRENT", 50), ("BEL", 5), ("HAL", 50), ("WIPRO", 5), ("JSWSTEEL", 5),
-    ("ASIANPAINT", 20),
+    ("INFY", 10), ("HINDUNILVR", 20), ("ITC", 5), ("SBIN", 5),
+    ("BHARTIARTL", 10), ("KOTAKBANK", 10), ("LT", 20), ("AXISBANK", 5),
+    ("TITAN", 50), ("SUNPHARMA", 20), ("NESTLEIND", 50), ("BAJFINANCE", 10),
+    ("POWERGRID", 5), ("NTPC", 5), ("TATAMOTORS", 5), ("M&M", 20),
+    ("HCLTECH", 10), ("MARUTI", 100), ("TATASTEEL", 2), ("ADANIENT", 20),
+    ("COALINDIA", 5), ("ONGC", 5), ("JSWSTEEL", 5), ("HINDALCO", 5),
+    ("BAJAJ-AUTO", 50), ("TATACONSUM", 5), ("EICHERMOT", 50), ("BPCL", 2),
+    ("CIPLA", 10), ("DRREDDY", 50), ("TECHM", 20), ("GRASIM", 20),
+    ("ULTRACEMCO", 50), ("WIPRO", 5), ("INDUSINDBANK", 10), ("ADANIPORTS", 10),
+    ("HDFCLIFE", 10), ("SBILIFE", 10), ("BAJAJFINSV", 20), ("ICICIGI", 20),
+    ("APOLLOHOSP", 50), ("DIVISLAB", 100), ("BEL", 5), ("HAL", 50),
+    ("ZOMATO", 2), ("TRENT", 50), ("ASIANPAINT", 20), ("SHRIRAMFIN", 20),
+    ("HEROMOTOCO", 20), ("VEDL", 2), ("GAIL", 2), ("PIDILITIND", 50),
+    ("MOTHERSON", 2), ("SIEMENS", 50), ("LTIM", 50), ("MEDANTA", 50),
+    ("JSWENERGY", 10), ("TORNTPHARM", 100), ("LICI", 10), ("TVSMOTOR", 20),
+    ("PNB", 2), ("BRITANNIA", 50), ("ASHOKLEY", 2), ("ICICIPRULI", 10),
+    ("JIOFIN", 2), ("IDFCFIRSTB", 2), ("CANBK", 2), ("UNIONBANK", 2),
+    ("BANKBARODA", 2), ("IOC", 2), ("SAIL", 2), ("NMDC", 2),
+    ("PFC", 2), ("RECLTD", 2), ("POLYCAB", 20), ("INDUSTOWER", 5),
+    ("GODREJCP", 10), ("MCDOWELL-N", 10), ("DMART", 50), ("TATAELXSI", 50),
+    ("COLPAL", 50), ("PERSISTENT", 50), ("NUVAMA", 50), ("INFRA", 5),
+    ("BALKRISIND", 20), ("BHARATFORG", 20), ("BHEL", 2), ("CROMPTON", 10),
+    ("DABUR", 10), ("ESCORTS", 50), ("EXIDEIND", 2), ("FINCABLES", 10),
+    ("FLUOROCHEM", 50), ("GSPL", 10), ("HAPPSTMND", 10), ("HONAUT", 50),
 ]
 
 INDEX_ROOTS = [("NIFTY", 50), ("BANKNIFTY", 100), ("SENSEX", 100)]
@@ -78,26 +97,28 @@ MCX_ROOTS = [("GOLD", 100), ("GOLDM", 100), ("SILVERM", 100), ("CRUDEOIL", 50), 
 
 def _build_universe() -> list[dict]:
     u = []
-    # Crypto underlyings
-    u += [{"sym": "BTCUSD", "kind": "crypto", "seg": "CRYPTO", "src": "delta", "gap": 500},
-          {"sym": "ETHUSD", "kind": "crypto", "seg": "CRYPTO", "src": "delta", "gap": 50}]
-    # Nifty 100 stocks
+    # BTC/ETH — 4 far OTM options via Delta (resolved dynamically)
+    u += [{"sym": "BTC_OTM_CE", "kind": "option", "seg": "CRYPTO", "src": "delta",
+           "underlying": "BTCUSD", "opt": "CE", "otm": 4, "gap": 500},
+          {"sym": "BTC_OTM_PE", "kind": "option", "seg": "CRYPTO", "src": "delta",
+           "underlying": "BTCUSD", "opt": "PE", "otm": 4, "gap": 500},
+          {"sym": "ETH_OTM_CE", "kind": "option", "seg": "CRYPTO", "src": "delta",
+           "underlying": "ETHUSD", "opt": "CE", "otm": 4, "gap": 50},
+          {"sym": "ETH_OTM_PE", "kind": "option", "seg": "CRYPTO", "src": "delta",
+           "underlying": "ETHUSD", "opt": "PE", "otm": 4, "gap": 50}]
+    # Nifty 100 — 2 far OTM options each CE/PE (monthly expiry)
     for name, gap in NIFTY100:
-        u.append({"sym": name, "kind": "stock", "seg": "NSE", "src": "upstox",
-                   "upstox_key": f"NSE_EQ|{name}", "gap": gap})
-    # Index options
+        u.append({"sym": f"{name}_CE", "kind": "option", "seg": "NSE", "src": "upstox",
+                   "fo_root": name, "opt": "CE", "otm": 2, "gap": gap, "exp_style": "monthly"})
+        u.append({"sym": f"{name}_PE", "kind": "option", "seg": "NSE", "src": "upstox",
+                   "fo_root": name, "opt": "PE", "otm": 2, "gap": gap, "exp_style": "monthly"})
+    # Index options (weekly expiry)
     for root, gap in INDEX_ROOTS:
         u.append({"sym": f"{root}CE", "kind": "option", "seg": "NSE", "src": "upstox",
                    "fo_root": root, "opt": "CE", "gap": gap, "exp_style": "weekly"})
         u.append({"sym": f"{root}PE", "kind": "option", "seg": "NSE", "src": "upstox",
                    "fo_root": root, "opt": "PE", "gap": gap, "exp_style": "weekly"})
-    # Nifty 100 options
-    for name, gap in NIFTY100:
-        u.append({"sym": f"{name}_CE", "kind": "option", "seg": "NSE", "src": "upstox",
-                   "fo_root": name, "opt": "CE", "gap": gap, "exp_style": "monthly"})
-        u.append({"sym": f"{name}_PE", "kind": "option", "seg": "NSE", "src": "upstox",
-                   "fo_root": name, "opt": "PE", "gap": gap, "exp_style": "monthly"})
-    # MCX options
+    # MCX commodity options (monthly expiry)
     for root, gap in MCX_ROOTS:
         u.append({"sym": f"{root}_CE", "kind": "option", "seg": "MCX", "src": "upstox",
                    "fo_root": root, "opt": "CE", "gap": gap, "exp_style": "monthly"})
@@ -122,7 +143,7 @@ _mcx_expiry_date: str = ""      # current MCX monthly expiry
 # TF cache: (sym, tf) -> (timestamp, DataFrame)
 _tf_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
 _1d_cache: dict[str, tuple[str, pd.DataFrame]] = {}   # sym -> (date_str, df)
-_weekly_pp_cache: dict[str, tuple[str, float | None]] = {}
+_weekly_pp_cache: dict[str, tuple[str, Optional[float]]] = {}
 
 UPSTOX_MASTER: list[dict] = []
 _upstox_master_ts: float = 0
@@ -136,7 +157,7 @@ _DELTA_API = "https://api.india.delta.exchange/v2"
 _DELTA_CDN = "https://cdn.india.deltaex.org/v2"
 
 
-def _delta_get(url: str) -> dict | None:
+def _delta_get(url: str) -> Optional[dict]:
     try:
         r = requests.get(url, timeout=15, headers={"Accept": "application/json"})
         return r.json() if r.ok else None
@@ -145,7 +166,7 @@ def _delta_get(url: str) -> dict | None:
         return None
 
 
-def _delta_candles(symbol: str, tf: str, lookback: int = 120) -> pd.DataFrame | None:
+def _delta_candles(symbol: str, tf: str, lookback: int = 120) -> Optional[pd.DataFrame]:
     res_map = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "1d"}
     secs = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "1d": 86400}
     end = int(time.time())
@@ -198,6 +219,56 @@ def _delta_options(symbol: str, ltp: float, expiry: str) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# DELTA OPTION RESOLVER (BTC/ETH)
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_crypto_ltp(symbol: str) -> Optional[float]:
+    """Get last traded price for a crypto underlying from Delta."""
+    data = _delta_get(f"{_DELTA_API}/tickers?symbol={symbol}")
+    if not data:
+        return None
+    tickers = data.get("result", [])
+    hit = next((t for t in tickers if t.get("symbol") == symbol), None)
+    if hit:
+        return float(hit.get("last_price") or hit.get("mark_price") or 0)
+    return None
+
+
+_delta_option_cache: dict[str, str] = {}  # sym_def key -> resolved option symbol
+
+
+def _resolve_delta_option(sym_def: dict) -> Optional[str]:
+    """Resolve BTC_OTM_CE/PE or ETH_OTM_CE/PE to actual Delta option symbol."""
+    global _delta_option_cache
+
+    underlying = sym_def.get("underlying", "BTCUSD")
+    opt_type = sym_def.get("opt", "CE")
+    otm = sym_def.get("otm", 4)
+    gap = sym_def.get("gap", 500)
+
+    cache_key = f"{underlying}|{opt_type}|{otm}"
+    if cache_key in _delta_option_cache:
+        return _delta_option_cache[cache_key]
+
+    ltp = _get_crypto_ltp(underlying)
+    if not ltp:
+        return None
+
+    today = datetime.now(IST).date()
+    expiry = _maybe_roll_crypto_expiry()
+    options = _delta_options(underlying, ltp, expiry)
+    if not options:
+        return None
+
+    target = next((o for o in options if o["type"] == opt_type and o["otm"] == otm), None)
+    if target:
+        _delta_option_cache[cache_key] = target["symbol"]
+        return target["symbol"]
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
 # UPSTOX API (NSE / MCX)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -212,7 +283,7 @@ _upstox_master_ts: float = 0
 _UPSTOX_MASTER_TTL = 6 * 3600
 
 
-def _upstox_get(url: str) -> dict | None:
+def _upstox_get(url: str) -> Optional[dict]:
     hdrs = {**_UPSTOX_HDRS}
     if UPSTOX_TOKEN:
         hdrs["Authorization"] = f"Bearer {UPSTOX_TOKEN}"
@@ -224,7 +295,7 @@ def _upstox_get(url: str) -> dict | None:
         return None
 
 
-def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> pd.DataFrame | None:
+def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> Optional[pd.DataFrame]:
     """Fetch 5m candles from Upstox historical API."""
     tf_map = {"5m": "minutes/5", "15m": "minutes/15", "30m": "minutes/30", "1h": "hours/1", "1d": "days/1"}
     interval = tf_map.get(tf, "minutes/5")
@@ -301,7 +372,7 @@ def _load_upstox_master() -> list[dict]:
     return instruments
 
 
-def _resolve_upstox_key(sym_def: dict) -> str | None:
+def _resolve_upstox_key(sym_def: dict) -> Optional[str]:
     """Find the instrument key for a given symbol definition."""
     master = _load_upstox_master()
     if not master:
@@ -318,6 +389,7 @@ def _resolve_upstox_key(sym_def: dict) -> str | None:
     fo_root = sym_def.get("fo_root")
     opt_type = sym_def.get("opt")
     gap = sym_def.get("gap", 50)
+    otm = sym_def.get("otm", 2)
 
     if kind == "stock":
         pattern = f"NSE_EQ|{sym_def['sym']}"
@@ -358,7 +430,7 @@ def _resolve_upstox_key(sym_def: dict) -> str | None:
             return None
 
         atm = int(round(spot / gap) * gap)
-        target = atm + gap if opt_type == "CE" else atm - gap
+        target = atm + (otm * gap) if opt_type == "CE" else atm - (otm * gap)
 
         # Find closest OTM
         hit = min(candidates, key=lambda m: abs(m.get("strike", 0) - target))
@@ -367,7 +439,7 @@ def _resolve_upstox_key(sym_def: dict) -> str | None:
     return None
 
 
-def _upstox_candles(sym_def: dict, tf: str = "5m", lookback: int = 120) -> pd.DataFrame | None:
+def _upstox_candles(sym_def: dict, tf: str = "5m", lookback: int = 120) -> Optional[pd.DataFrame]:
     """Fetch candles for any Upstox instrument."""
     key = _resolve_upstox_key(sym_def)
     if not key:
@@ -375,7 +447,7 @@ def _upstox_candles(sym_def: dict, tf: str = "5m", lookback: int = 120) -> pd.Da
     return _upstox_fetch_candles(key, tf, lookback)
 
 
-def _upstox_prev_day_vol(sym_def: dict) -> float | None:
+def _upstox_prev_day_vol(sym_def: dict) -> Optional[float]:
     """Get previous day volume for entry gate."""
     key = _resolve_upstox_key(sym_def)
     if not key:
@@ -396,6 +468,40 @@ def _next_weekly_expiry(base: datetime, day_of_week: int = 3) -> datetime.date:
     if days_ahead <= 0:
         days_ahead += 7
     return (base + timedelta(days=days_ahead)).date()
+
+
+def _next_delta_expiry() -> str:
+    """Get next Delta crypto option expiry (daily)."""
+    today = datetime.now(UTC).date()
+    for i in range(7):
+        d = today + timedelta(days=i)
+        if d.weekday() < 5:  # Mon-Fri
+            return d.strftime("%Y-%m-%d")
+    return today.strftime("%Y-%m-%d")
+
+
+def _maybe_roll_crypto_expiry() -> str:
+    """Roll to next expiry if current is expiring today."""
+    now_utc = datetime.now(UTC)
+    now_ist = datetime.now(IST)
+    # After 4 PM IST = after 10:30 AM UTC, roll to next expiry
+    if now_ist.hour >= 16:
+        return _next_delta_expiry()
+    # Check if today's expiry has already happened (use UTC time)
+    today_exp = now_utc.date().strftime("%Y-%m-%d")
+    data = _delta_get(f"{_DELTA_API}/products?contract_types=call_options,put_options&states=live&underlying_asset_symbols=BTC,ETH")
+    if data:
+        products = data.get("result", [])
+        today_expiries = [p for p in products if p.get("settlement_time", "")[:10] == today_exp]
+        if today_expiries:
+            # Check if first expiry time has passed
+            first = min(today_expiries, key=lambda p: p.get("settlement_time", ""))
+            settl = first.get("settlement_time", "")
+            if settl:
+                settl_dt = datetime.fromisoformat(settl.replace("Z", "+00:00"))
+                if now_utc >= settl_dt:
+                    return _next_delta_expiry()
+    return today_exp
 
 
 def _next_monthly_expiry(base: datetime, roll_days_before: int = 5) -> datetime.date:
@@ -424,7 +530,7 @@ def _next_monthly_expiry(base: datetime, roll_days_before: int = 5) -> datetime.
     return last_thu
 
 
-def _current_expiry(seg: str, style: str = "monthly") -> datetime.date | None:
+def _current_expiry(seg: str, style: str = "monthly") -> Optional[datetime.date]:
     """Get the current active expiry date for a segment."""
     now = datetime.now(IST)
     if style == "weekly":
@@ -432,24 +538,6 @@ def _current_expiry(seg: str, style: str = "monthly") -> datetime.date | None:
     return _next_monthly_expiry(now)
 
 
-def _maybe_roll_crypto_expiry() -> str:
-    """After 4 PM IST, roll crypto expiry to next day."""
-    global _crypto_expiry_date
-    now = datetime.now(IST)
-    hh, mm = now.hour, now.minute
-
-    if not _crypto_expiry_date:
-        _crypto_expiry_date = (now + timedelta(days=1)).date().isoformat()
-        return _crypto_expiry_date
-
-    # After 4 PM, roll to next day
-    if hh >= 16:
-        next_date = (now + timedelta(days=1)).date().isoformat()
-        if next_date != _crypto_expiry_date:
-            _crypto_expiry_date = next_date
-            logger.info(f"[EXPIRY] Crypto rolled to {_crypto_expiry_date}")
-
-    return _crypto_expiry_date
 
 
 def _maybe_roll_nse_expiry() -> str:
@@ -552,7 +640,7 @@ def _pct_range(s: pd.Series) -> float:
     return 0.0 if not m else float((s.max() - s.min()) / m)
 
 
-def _prev_day_hlcv(df: pd.DataFrame) -> tuple | None:
+def _prev_day_hlcv(df: pd.DataFrame) -> Optional[tuple]:
     try:
         d = df.copy()
         d["_d"] = pd.to_datetime(d["timestamp"]).dt.date
@@ -589,7 +677,7 @@ def _calc_pivots(df: pd.DataFrame) -> dict:
         return {}
 
 
-def _calc_weekly_pp(df_1d: pd.DataFrame | None) -> float | None:
+def _calc_weekly_pp(df_1d: Optional[pd.DataFrame]) -> Optional[float]:
     if df_1d is None or len(df_1d) < 7:
         return None
     try:
@@ -608,7 +696,7 @@ def _calc_weekly_pp(df_1d: pd.DataFrame | None) -> float | None:
         return None
 
 
-def _compute_stars(close: float, pivots: dict, weekly_pp: float | None) -> int:
+def _compute_stars(close: float, pivots: dict, weekly_pp: Optional[float]) -> int:
     stars = 0
     for level, pts in [(pivots.get("PP"), 2), (pivots.get("R1"), 3),
                        (pivots.get("R2"), 4), (pivots.get("R3"), 5)]:
@@ -628,9 +716,27 @@ def _compute_stars(close: float, pivots: dict, weekly_pp: float | None) -> int:
 _CANDLE_TTL = {"5m": 0, "15m": 300, "30m": 600, "1h": 900, "1d": 86400}
 
 
-def fetch_candles(sym_def: dict, tf: str, lookback: int = 120) -> pd.DataFrame | None:
+def fetch_candles(sym_def: dict, tf: str, lookback: int = 120) -> Optional[pd.DataFrame]:
     """Unified candle fetch — Delta for crypto, Upstox for NSE/MCX."""
     src = sym_def.get("src", "delta")
+
+    if src == "delta" and sym_def.get("kind") == "option":
+        symbol = sym_def.get("underlying", sym_def["sym"])
+        resolved = sym_def.get("_resolved_symbol")
+        if not resolved:
+            resolved = _resolve_delta_option(sym_def)
+            sym_def["_resolved_symbol"] = resolved
+        if resolved:
+            symbol = resolved
+        df = _delta_candles(symbol, tf, lookback)
+        # Resolve the option once and cache the actual symbol
+        if df is None and not sym_def.get("_resolved_symbol"):
+            actual = _resolve_delta_option(sym_def)
+            if actual:
+                sym_def["_resolved_symbol"] = actual
+                df = _delta_candles(actual, tf, lookback)
+        return df
+
     if src == "delta":
         return _delta_candles(sym_def["sym"], tf, lookback)
 
@@ -651,7 +757,7 @@ def fetch_candles(sym_def: dict, tf: str, lookback: int = 120) -> pd.DataFrame |
     return df
 
 
-def _get_1d_cached(sym_def: dict) -> pd.DataFrame | None:
+def _get_1d_cached(sym_def: dict) -> Optional[pd.DataFrame]:
     """Get cached 1d data or fetch fresh."""
     sym = sym_def["sym"]
     hit = _1d_cache.get(sym)
@@ -667,7 +773,7 @@ def _get_1d_cached(sym_def: dict) -> pd.DataFrame | None:
 # S9 DETECTION
 # ═══════════════════════════════════════════════════════════════════
 
-def _blast_up(df: pd.DataFrame) -> dict | None:
+def _blast_up(df: pd.DataFrame) -> Optional[dict]:
     d = _add_indicators(df).dropna().reset_index(drop=True)
     if len(d) < 2:
         return None
@@ -682,7 +788,7 @@ def _blast_up(df: pd.DataFrame) -> dict | None:
     }
 
 
-def _pp_inside_bb(df: pd.DataFrame | None, pp: float, prev_candle: bool = False) -> bool | None:
+def _pp_inside_bb(df: Optional[pd.DataFrame], pp: float, prev_candle: bool = False) -> Optional[bool]:
     if df is None or len(df) < BB_PERIOD + 2:
         return None
     d = _add_indicators(df).dropna()
@@ -708,7 +814,7 @@ def _is_bb_flat(df: pd.DataFrame) -> bool:
 
 
 def _entry_gate(ts: datetime, candle_open: float, candle_close: float, candle_high: float,
-                pd_high: float | None, pd_vol: float | None, day_high: float | None,
+                pd_high: Optional[float], pd_vol: Optional[float], day_high: Optional[float],
                 seg: str) -> tuple[bool, str]:
     open_hr, open_mn = SEGMENT_OPEN.get(seg, (0, 0))
     open_dt = ts.replace(hour=open_hr, minute=open_mn, second=0, microsecond=0)
@@ -733,7 +839,7 @@ def _entry_gate(ts: datetime, candle_open: float, candle_close: float, candle_hi
     return False, "Mid-day gate FAIL"
 
 
-def detect_s9(sym_def: dict, tf: str = "5m") -> dict | None:
+def detect_s9(sym_def: dict, tf: str = "5m") -> Optional[dict]:
     """Run S9 detection on one symbol + timeframe."""
     lookback = 200 if tf == "1d" else 120
     df = fetch_candles(sym_def, tf, lookback)
@@ -1101,15 +1207,14 @@ def telegram_bot():
 
                 if text == "/status":
                     active = sum(1 for v in _states.values() if v.get("blast_ts"))
-                    bl = sum(1 for k, v in _states.items() if v.get("blacklisted") and _should_blacklist(next((u for u in UNIVERSE if u["sym"] == k), {})))
+                    bl = sum(1 for k, v in _states.items() if v.get("blacklisted"))
                     _send_tg(
                         f"📊 S9 Scanner\n\n"
                         f"▶️ {'Paused' if _scanner_paused else 'Running'}\n"
-                        f"📡 Delta: BTC/ETH\n"
-                        f"📡 Upstox: NSE + MCX\n"
+                        f"📡 Delta: BTC/ETH 4-OTM options\n"
+                        f"📡 Upstox: NSE 100 (2-OTM) + NSE/MCX index options\n"
                         f"🔍 Universe: {len(UNIVERSE)} instruments\n"
                         f"🔥 Active blasts: {active}\n"
-                        f"🚫 Blacklisted (stocks): {bl}\n"
                         f"🕐 {datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}\n\n"
                         f"Commands: /status /pause /resume /scan /help"
                     )
@@ -1147,11 +1252,11 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("S9 Scanner — Multi-Exchange (Delta + Upstox)")
     logger.info(f"Universe: {len(UNIVERSE)} instruments")
-    logger.info(f"  CRYPTO: 2 (BTCUSD, ETHUSD)")
+    logger.info(f"  CRYPTO: 4 (BTC/ETH 4-OTM options)")
     nse_count = sum(1 for u in UNIVERSE if u["seg"] == "NSE")
     mcx_count = sum(1 for u in UNIVERSE if u["seg"] == "MCX")
-    logger.info(f"  NSE: {nse_count} (stocks + options)")
-    logger.info(f"  MCX: {mcx_count} (options)")
+    logger.info(f"  NSE: {nse_count} options (Nifty100 2-OTM + indices)")
+    logger.info(f"  MCX: {mcx_count} options")
     logger.info(f"Time: {datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}")
     logger.info("=" * 60)
 
@@ -1170,7 +1275,8 @@ if __name__ == "__main__":
     # Startup Telegram ping
     _send_tg(
         f"🚀 S9 Scanner LIVE\n\n"
-        f"🌐 BTC/ETH + NSE 100 stocks + NSE/MCX options\n"
+        f"📊 Nifty 100 options (2-OTM) + NSE/MCX index options\n"
+        f"₿ BTC/ETH 4-OTM options\n"
         f"📡 Delta + Upstox\n"
         f"⏱ Har 5 min\n"
         f"🕐 {datetime.now(IST).strftime('%d-%m-%Y %H:%M IST')}"
