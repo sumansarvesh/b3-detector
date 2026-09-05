@@ -1165,7 +1165,7 @@ if __name__ == "__main__":
         logger.warning("[UPSTOX] No token — NSE/MCX scan disabled")
 
     _maybe_roll_crypto_expiry()
-    _reset_day()
+    _maybe_reset_day()
 
     # Startup Telegram ping
     _send_tg(
