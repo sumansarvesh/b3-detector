@@ -326,49 +326,77 @@ def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> 
 
 
 def _load_upstox_master() -> list[dict]:
-    """Load Upstox instrument master (cached)."""
+    """Load Upstox BOD instrument master from public JSON.gz (CSV deprecated/403)."""
     global _upstox_master_cache, _upstox_master_ts
     now = time.time()
     if _upstox_master_cache and (now - _upstox_master_ts) < _UPSTOX_MASTER_TTL:
         return _upstox_master_cache
+
+    import gzip
     instruments = []
-    for url in [
-        "https://assets.upstox.com/market-quote/instruments/exchange_NSE.csv",
-        "https://assets.upstox.com/market-quote/instruments/exchange_NSE_FO.csv",
-        "https://assets.upstox.com/market-quote/instruments/exchange_MCX.csv",
-        "https://assets.upstox.com/market-quote/instruments/exchange_MCX_FO.csv",
-    ]:
+    urls = [
+        "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+        "https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz",
+    ]
+    # Do not send Bearer — CDN is public; auth headers can confuse some edges.
+    hdrs = {"Accept": "*/*", "User-Agent": "S9Scanner/1.0"}
+
+    for url in urls:
         try:
-            r = requests.get(url, timeout=30, headers=_UPSTOX_HDRS)
+            r = requests.get(url, timeout=60, headers=hdrs)
             if not r.ok:
+                logger.warning(f"[UPSTOX] Master HTTP {r.status_code} for {url}")
                 continue
-            text = r.text
-            lines = text.splitlines()
-            if not lines:
+            raw = gzip.decompress(r.content)
+            rows = json.loads(raw)
+            if not isinstance(rows, list):
+                logger.warning(f"[UPSTOX] Master unexpected JSON shape for {url}")
                 continue
-            header = [h.strip().strip('"') for h in lines[0].split(",")]
-            idx = {h: i for i, h in enumerate(header)}
-            for line in lines[1:]:
-                parts = line.split(",")
-                if len(parts) < len(header):
-                    continue
-                def _col(name):
-                    pos = idx.get(name, -1)
-                    return parts[pos].strip().strip('"') if pos >= 0 else ""
+            for row in rows:
+                seg = (row.get("segment") or "").strip()
+                itype = (row.get("instrument_type") or "").strip()
+                # JSON uses CE/PE as instrument_type; legacy code expected OPT* + option_type
+                if itype in ("CE", "PE"):
+                    option_type = itype
+                    asset = (row.get("asset_type") or "").upper()
+                    if asset == "INDEX":
+                        instrument_type = "OPTIDX"
+                    elif asset == "COM":
+                        instrument_type = "OPTFUT"
+                    else:
+                        instrument_type = "OPTSTK"
+                else:
+                    option_type = (row.get("option_type") or "").strip()
+                    instrument_type = itype
+
+                exp = row.get("expiry")
+                exp_str = ""
+                if isinstance(exp, (int, float)) and exp > 0:
+                    exp_str = datetime.fromtimestamp(exp / 1000.0, tz=IST).strftime("%Y-%m-%d")
+                elif isinstance(exp, str) and exp:
+                    exp_str = exp[:10]
+
+                # FO rows: match universe fo_root on underlying_symbol (RELIANCE), not long company name
+                und = (row.get("underlying_symbol") or "").strip()
+                nm = (row.get("name") or "").strip()
                 instruments.append({
-                    "key": _col("instrument_key"),
-                    "symbol": _col("trading_symbol"),
-                    "exchange": _col("exchange"),
-                    "instrument_type": _col("instrument_type"),
-                    "option_type": _col("option_type"),
-                    "strike": float(_col("strike_price") or 0),
-                    "expiry": _col("expiry"),
-                    "lot_size": int(_col("lot_size") or 0),
-                    "tick_size": float(_col("tick_size") or 0),
-                    "prev_close": float(_col("last_price") or 0),
+                    "key": row.get("instrument_key") or "",
+                    "symbol": row.get("trading_symbol") or "",
+                    "name": und or nm,
+                    "underlying_symbol": und or nm,
+                    "exchange": seg or (row.get("exchange") or ""),
+                    "instrument_type": instrument_type,
+                    "option_type": option_type,
+                    "strike": float(row.get("strike_price") or 0),
+                    "expiry": exp_str,
+                    "lot_size": int(row.get("lot_size") or 0),
+                    "tick_size": float(row.get("tick_size") or 0),
+                    "prev_close": float(row.get("last_price") or row.get("close_price") or 0),
                 })
+            logger.info(f"[UPSTOX] {url.rsplit('/', 1)[-1]}: +{len(rows)} rows")
         except Exception as e:
             logger.warning(f"[UPSTOX] Master load failed for {url}: {e}")
+
     _upstox_master_cache = instruments
     _upstox_master_ts = now
     logger.info(f"[UPSTOX] Master loaded: {len(instruments)} instruments")
@@ -395,47 +423,85 @@ def _resolve_upstox_key(sym_def: dict) -> Optional[str]:
     otm = sym_def.get("otm", 2)
 
     if kind == "stock":
-        pattern = f"NSE_EQ|{sym_def['sym']}"
-        hit = next((m for m in master if m["key"] == pattern), None)
+        # Equity keys are NSE_EQ|<ISIN>; match by trading name / symbol when possible
+        name = sym_def.get("sym") or ""
+        hit = next((m for m in master
+                    if m.get("exchange") == "NSE_EQ"
+                    and m.get("instrument_type") == "EQ"
+                    and (m.get("name") == name or m.get("symbol") == name
+                         or m.get("symbol", "").startswith(name))), None)
         return hit["key"] if hit else None
 
     if kind == "option" and fo_root:
-        today = datetime.now(IST).date()
-        # Get current expiry
         exp_date = _current_expiry(seg, sym_def.get("exp_style", "monthly"))
         exp_str = exp_date.strftime("%Y-%m-%d") if exp_date else ""
+        want_exch = "MCX_FO" if seg == "MCX" else "NSE_FO"
 
-        # Find matching options
         candidates = [
             m for m in master
-            if m.get("exchange") == ("MCX_FO" if seg == "MCX" else "NSE_FO")
+            if m.get("exchange") == want_exch
             and m.get("instrument_type") in ("OPTIDX", "OPTSTK", "OPTFUT")
             and m.get("option_type") == opt_type
-            and m.get("expiry", "") == exp_str
+            and (m.get("name") == fo_root or m.get("underlying_symbol") == fo_root)
+            and (not exp_str or m.get("expiry", "") == exp_str)
         ]
+        if not candidates and exp_str:
+            # Fallback: nearest future expiry for this root
+            cands2 = [
+                m for m in master
+                if m.get("exchange") == want_exch
+                and m.get("instrument_type") in ("OPTIDX", "OPTSTK", "OPTFUT")
+                and m.get("option_type") == opt_type
+                and (m.get("name") == fo_root or m.get("underlying_symbol") == fo_root)
+                and m.get("expiry", "") >= exp_str
+            ]
+            if cands2:
+                nearest = min(cands2, key=lambda m: m.get("expiry", "9999"))
+                exp_str = nearest.get("expiry", exp_str)
+                candidates = [m for m in cands2 if m.get("expiry") == exp_str]
 
         if not candidates:
             return None
 
-        # Get spot price
-        spot_key = f"NSE_INDEX|{fo_root}" if seg == "NSE" else f"MCX_FO|{fo_root}"
-        spot_row = next((m for m in master if m["key"] == spot_key), None)
-        if not spot_row:
-            # Try MCX futures
-            spot_key = f"MCX_FO|{fo_root}FUT"
-            spot_row = next((m for m in master if m["key"] == spot_key), None)
+        # Spot for ATM: live LTP when possible; index name map for keys
+        INDEX_SPOT = {
+            "NIFTY": "NSE_INDEX|Nifty 50",
+            "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+            "SENSEX": "BSE_INDEX|SENSEX",
+        }
+        spot = 0.0
+        if seg == "NSE" and fo_root in INDEX_SPOT:
+            spot_key = INDEX_SPOT[fo_root]
+            df = _upstox_fetch_candles(spot_key, "5m", 5)
+            if df is not None and len(df):
+                spot = float(df.iloc[-1]["close"])
+        elif seg == "NSE":
+            # stock underlying — try EQ by name then FO futures close
+            eq = next((m for m in master
+                       if m.get("exchange") == "NSE_EQ" and m.get("instrument_type") == "EQ"
+                       and (m.get("name") == fo_root or m.get("symbol") == fo_root)), None)
+            if eq:
+                df = _upstox_fetch_candles(eq["key"], "5m", 5)
+                if df is not None and len(df):
+                    spot = float(df.iloc[-1]["close"])
+        else:
+            fut = next((m for m in master
+                        if m.get("exchange") == "MCX_FO" and m.get("instrument_type") == "FUT"
+                        and (m.get("name") == fo_root or m.get("underlying_symbol") == fo_root)), None)
+            if fut:
+                df = _upstox_fetch_candles(fut["key"], "5m", 5)
+                if df is not None and len(df):
+                    spot = float(df.iloc[-1]["close"])
 
-        if not spot_row:
-            return None
-
-        spot = spot_row.get("prev_close", 0)
         if spot <= 0:
-            return None
+            # last resort: median strike of this expiry as ATM proxy
+            strikes = sorted(m.get("strike", 0) for m in candidates if m.get("strike"))
+            if not strikes:
+                return None
+            spot = strikes[len(strikes) // 2]
 
         atm = int(round(spot / gap) * gap)
         target = atm + (otm * gap) if opt_type == "CE" else atm - (otm * gap)
-
-        # Find closest OTM
         hit = min(candidates, key=lambda m: abs(m.get("strike", 0) - target))
         return hit["key"] if hit else None
 
