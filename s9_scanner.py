@@ -326,58 +326,52 @@ def _upstox_fetch_candles(instrument_key: str, tf: str, lookback: int = 120) -> 
 
 
 def _load_upstox_master() -> list[dict]:
-    """Load instruments via authenticated API (no CSV needed)."""
+    """Load Upstox instrument master (cached)."""
     global _upstox_master_cache, _upstox_master_ts
     now = time.time()
     if _upstox_master_cache and (now - _upstox_master_ts) < _UPSTOX_MASTER_TTL:
         return _upstox_master_cache
-
     instruments = []
-
-    if not UPSTOX_TOKEN:
-        logger.error("[UPSTOX] No token available — cannot load instruments")
-        return []
-
-    logger.info("[UPSTOX] Fetching instruments via authenticated API...")
-    api_url = "https://api.upstox.com/v2/instruments"
-    hdrs = {**_UPSTOX_HDRS, "Authorization": f"Bearer {UPSTOX_TOKEN}"}
-
-    for segment in ["NSE", "NSE_FO", "MCX", "MCX_FO"]:
+    for url in [
+        "https://assets.upstox.com/market-quote/instruments/exchange_NSE.csv",
+        "https://assets.upstox.com/market-quote/instruments/exchange_NSE_FO.csv",
+        "https://assets.upstox.com/market-quote/instruments/exchange_MCX.csv",
+        "https://assets.upstox.com/market-quote/instruments/exchange_MCX_FO.csv",
+    ]:
         try:
-            r = requests.get(f"{api_url}?segment={segment}", headers=hdrs, timeout=60)
-            logger.info(f"[UPSTOX] {segment}: HTTP {r.status_code}, size={len(r.text)}")
+            r = requests.get(url, timeout=30, headers=_UPSTOX_HDRS)
             if not r.ok:
-                logger.warning(f"[UPSTOX] {segment} failed: HTTP {r.status_code} {r.text[:200]}")
                 continue
-            data = r.json()
-            items = data.get("data", [])
-            if not items:
-                logger.warning(f"[UPSTOX] {segment}: empty data")
+            text = r.text
+            lines = text.splitlines()
+            if not lines:
                 continue
-            for item in items:
+            header = [h.strip().strip('"') for h in lines[0].split(",")]
+            idx = {h: i for i, h in enumerate(header)}
+            for line in lines[1:]:
+                parts = line.split(",")
+                if len(parts) < len(header):
+                    continue
+                def _col(name):
+                    pos = idx.get(name, -1)
+                    return parts[pos].strip().strip('"') if pos >= 0 else ""
                 instruments.append({
-                    "key": item.get("instrument_key", ""),
-                    "symbol": item.get("trading_symbol", ""),
-                    "exchange": item.get("exchange", ""),
-                    "instrument_type": item.get("instrument_type", ""),
-                    "option_type": item.get("option_type", ""),
-                    "strike": float(item.get("strike_price") or 0),
-                    "expiry": item.get("expiry", ""),
-                    "lot_size": int(item.get("lot_size") or 0),
-                    "tick_size": float(item.get("tick_size") or 0),
-                    "prev_close": float(item.get("last_price") or 0),
+                    "key": _col("instrument_key"),
+                    "symbol": _col("trading_symbol"),
+                    "exchange": _col("exchange"),
+                    "instrument_type": _col("instrument_type"),
+                    "option_type": _col("option_type"),
+                    "strike": float(_col("strike_price") or 0),
+                    "expiry": _col("expiry"),
+                    "lot_size": int(_col("lot_size") or 0),
+                    "tick_size": float(_col("tick_size") or 0),
+                    "prev_close": float(_col("last_price") or 0),
                 })
-            logger.info(f"[UPSTOX] {segment}: loaded {len(items)} instruments")
         except Exception as e:
-            logger.warning(f"[UPSTOX] {segment} error: {e}")
-
-    if not instruments:
-        logger.error("[UPSTOX] All segments failed — no instruments loaded")
-        return []
-
+            logger.warning(f"[UPSTOX] Master load failed for {url}: {e}")
     _upstox_master_cache = instruments
     _upstox_master_ts = now
-    logger.info(f"[UPSTOX] Master loaded: {len(instruments)} instruments (API)")
+    logger.info(f"[UPSTOX] Master loaded: {len(instruments)} instruments")
     return instruments
 
 
